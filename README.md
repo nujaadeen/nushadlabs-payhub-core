@@ -58,7 +58,8 @@ and on each credential field) and will be addressed in a later phase.
 ## Project layout
 
 - `payhub/` - Django project settings, root URLconf
-- `tenants/` - `Tenant` and `Customer` reference models
+- `tenants/` - `Tenant` and `Customer` models, plus the `/tenants/` and
+  `/customers/` creation-only endpoints (serializers, views, urls)
 - `payments_core/` - `PaymentProvider`, `PaymentToken`, `PaymentTransaction`
   models (including the full `_process()` pipeline), the
   `PaymentProviderAdapter` interface, the `/providers/`, `/payments/`, and
@@ -123,6 +124,33 @@ python manage.py runserver
 ```bash
 curl http://localhost:8000/health/
 # {"status": "ok"}
+```
+
+## API reference (tenants app)
+
+Creation-only - no auth, matching every other endpoint. There's no
+list/get/update/delete for either of these yet; that's out of scope so far.
+
+### Create a tenant
+
+```bash
+curl -X POST http://localhost:8000/tenants/ \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Acme Inc"}'
+```
+
+### Create a customer
+
+`tenant` must be a real tenant UUID (a made-up or missing tenant returns a
+clean 400, not a 500 - DRF validates the foreign key automatically). A
+customer's `reference` only has to be unique per-tenant, not globally -
+registering the same `reference` twice under the same tenant returns a
+clean 400.
+
+```bash
+curl -X POST http://localhost:8000/customers/ \
+  -H "Content-Type: application/json" \
+  -d '{"tenant": "<tenant-uuid>", "reference": "acme-customer-1"}'
 ```
 
 ## API reference (Phase 1)
@@ -506,17 +534,19 @@ Putting every phase together - onboard a provider, create a payment, drive
 it to completion via a webhook, and confirm the final state:
 
 ```bash
-# 1. Create a tenant and customer directly via Django shell (no API for
-#    this yet - Tenant/Customer creation isn't part of any phase's scope).
-python manage.py shell -c "
-from tenants.models import Tenant, Customer
-t = Tenant.objects.create(name='Acme Inc')
-c = Customer.objects.create(tenant=t, reference='acme-customer-1')
-print('TENANT_ID=' + str(t.id))
-print('CUSTOMER_ID=' + str(c.id))
-"
+# 1. Create a tenant.
+curl -X POST http://localhost:8000/tenants/ \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Acme Inc"}'
+# -> note the returned "id" (TENANT_ID)
 
-# 2. Onboard a Stripe provider (use your own test-mode keys - see "Getting
+# 2. Create a customer under that tenant.
+curl -X POST http://localhost:8000/customers/ \
+  -H "Content-Type: application/json" \
+  -d '{"tenant": "<TENANT_ID>", "reference": "acme-customer-1"}'
+# -> note the returned "id" (CUSTOMER_ID)
+
+# 3. Onboard a Stripe provider (use your own test-mode keys - see "Getting
 #    test-mode API keys" above).
 curl -X POST http://localhost:8000/providers/ \
   -H "Content-Type: application/json" \
@@ -529,15 +559,15 @@ curl -X POST http://localhost:8000/providers/ \
   }'
 # -> note the returned provider "id"
 
-# 3. Enable it (providers start "disabled" - see PaymentProvider.state).
+# 4. Enable it (providers start "disabled" - see PaymentProvider.state).
 curl -X PATCH http://localhost:8000/providers/<PROVIDER_ID>/ \
   -H "Content-Type: application/json" -d '{"state": "test"}'
 
-# 4. Start forwarding Stripe webhooks to this provider (see "Webhook
+# 5. Start forwarding Stripe webhooks to this provider (see "Webhook
 #    setup" above) - keep this running in its own terminal:
 stripe listen --forward-to localhost:8000/webhooks/stripe/<PROVIDER_ID>/
 
-# 5. Create a payment.
+# 6. Create a payment.
 curl -X POST http://localhost:8000/payments/ \
   -H "Content-Type: application/json" \
   -d '{
@@ -547,18 +577,18 @@ curl -X POST http://localhost:8000/payments/ \
   }'
 # -> note "id" (transaction id) and "redirect_url"
 
-# 6. Open redirect_url in a browser, pay with Stripe's test card
+# 7. Open redirect_url in a browser, pay with Stripe's test card
 #    4242 4242 4242 4242 (any future expiry, any CVC). Stripe sends a
 #    webhook, which the `stripe listen` terminal forwards to your local
 #    server automatically.
 
-# 7. Confirm the transaction reached "done".
+# 8. Confirm the transaction reached "done".
 curl http://localhost:8000/payments/<TRANSACTION_ID>/
 # {"...", "state": "done", ...}
 ```
 
 The same flow works for Adyen, substituting `code: "adyen"` /
-`adyen_config` in step 2 and the Adyen webhook setup in step 4 - though see
+`adyen_config` in step 3 and the Adyen webhook setup in step 5 - though see
 the "known limitation" note above about Adyen needing real `paymentMethod`
 details this project doesn't send yet, which makes a fully real end-to-end
 Adyen run harder to trigger than Stripe's without building the

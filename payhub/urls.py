@@ -28,4 +28,9 @@ urlpatterns = [
     # this path off to payments_core/urls.py, so this file doesn't have to
     # list every app's individual routes itself.
     path('', include('payments_core.urls')),
+    # POST /tenants/ and POST /customers/ - the only tenants app endpoints;
+    # everything else about Tenant/Customer (listing, updates) is still
+    # shell/ORM-only, out of scope so far. Same prefix-less include()
+    # pattern as payments_core.urls above.
+    path('', include('tenants.urls')),
 ]
