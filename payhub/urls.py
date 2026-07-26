@@ -15,14 +15,17 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path
+from django.urls import include, path
 
 from payments_core.views import HealthCheckView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    # Phase 0: the only API endpoint that exists so far - just confirms the
-    # project is up and wired together correctly. Phase 1+ will add the real
-    # onboarding/payment/webhook endpoints under their own paths.
+    # Phase 0: confirms the project is up and wired together correctly.
     path('health/', HealthCheckView.as_view(), name='health-check'),
+    # Phase 1: onboarding endpoints (POST/GET /providers/, GET/PATCH/DELETE
+    # /providers/{id}/) - include() hands URL resolution for anything under
+    # this path off to payments_core/urls.py, so this file doesn't have to
+    # list every app's individual routes itself.
+    path('', include('payments_core.urls')),
 ]

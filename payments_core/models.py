@@ -94,15 +94,27 @@ class PaymentProvider(models.Model):
         above by delegating to a code-specific override (e.g. the Stripe
         module overrides this to declare "I support partial refunds").
 
-        We don't have Odoo's compute-field framework in Django, so this will
-        instead be called explicitly (e.g. from a save() override or a
-        service function) once the adapter apps exist to answer "what do I
-        support". For now this is just the hook - wiring it up to the
-        Stripe/Adyen adapters happens in Phase 1.
+        This is the BASE implementation - it always declares "nothing is
+        implemented", which is correct for a provider with no adapter, and
+        is also the correct answer for this whole project right now since we
+        have only implemented payment creation so far (no capture, refund,
+        tokenization, or express checkout for any provider yet).
+
+        We don't have Odoo's compute-field framework in Django (no
+        @api.depends, no real inheritance between this model and the
+        Stripe/Adyen adapter apps), so instead each adapter app exposes its
+        own get_feature_support_fields(provider) function - see
+        payments_stripe/services.py and payments_adyen/services.py - which
+        calls this base method and then overrides individual keys as real
+        support gets implemented. That function call is the Django
+        equivalent of Odoo's override chain here.
         """
-        # Phase 1 TODO: dispatch to the adapter (via `code`) to fill in the
-        # support_* fields on this instance.
-        raise NotImplementedError("Implemented in Phase 1 by the provider adapters")
+        return {
+            "support_manual_capture": "not_implemented",
+            "support_refund": "not_implemented",
+            "support_tokenization": "not_implemented",
+            "support_express_checkout": "not_implemented",
+        }
 
 
 class PaymentToken(models.Model):
@@ -120,8 +132,14 @@ class PaymentToken(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="payment_tokens")
+    # on_delete=PROTECT (not CASCADE): we never hard-delete a PaymentProvider
+    # (see the DELETE /providers/{id}/ endpoint - it soft-deletes by flipping
+    # state/is_published instead). PROTECT is a second line of defense: if
+    # something ever DID try to hard-delete a provider row directly, Django
+    # would refuse and raise ProtectedError rather than silently wiping out
+    # every saved card that points at it.
     provider = models.ForeignKey(
-        PaymentProvider, on_delete=models.CASCADE, related_name="tokens"
+        PaymentProvider, on_delete=models.PROTECT, related_name="tokens"
     )
     customer = models.ForeignKey(
         Customer, on_delete=models.CASCADE, related_name="payment_tokens"
@@ -166,8 +184,13 @@ class PaymentTransaction(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="transactions")
+    # on_delete=PROTECT - same reasoning as PaymentToken.provider above: a
+    # provider is soft-deleted (see DELETE /providers/{id}/), never hard-
+    # deleted, and this FK guarantees the database itself will refuse a hard
+    # delete that would otherwise orphan (or silently wipe out) real
+    # payment history.
     provider = models.ForeignKey(
-        PaymentProvider, on_delete=models.CASCADE, related_name="transactions"
+        PaymentProvider, on_delete=models.PROTECT, related_name="transactions"
     )
     token = models.ForeignKey(
         PaymentToken, on_delete=models.SET_NULL, null=True, blank=True, related_name="transactions"
