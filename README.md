@@ -33,6 +33,15 @@ This is a portfolio/learning project, built in phases.
   logs it, then still responds 200/`"[accepted]"` so the provider doesn't
   keep retrying - so it's noisy in the logs rather than harmful, but it's
   still a gap worth knowing about.
+- **Currency filtering** (this state): `GET /providers/?tenant_id=...`
+  accepts an optional `&currency=` filter so a tenant's payment page can
+  list only the providers that support a customer's chosen currency. This
+  mirrors Odoo's `payment.provider._get_supported_currencies()` exactly:
+  which currencies a provider supports is a **hardcoded constant in the
+  adapter's own code** (`payments_stripe/const.py`,
+  `payments_adyen/const.py`), NOT a database field - a tenant can't
+  configure or override it via the API. See "List a tenant's providers"
+  below.
 - Both Stripe and Adyen adapters call their REST APIs directly over plain
   HTTP (via Python's `requests`) - no Stripe SDK, matching how Odoo's own
   payment_stripe/payment_adyen modules work.
@@ -168,12 +177,54 @@ required; registering the same `code` twice for the same tenant returns a
 
 ### List a tenant's providers
 
-`GET /providers/?tenant_id=<tenant-uuid>` - `tenant_id` is required. Response
-never includes credential fields.
+`GET /providers/?tenant_id=<tenant-uuid>` - `tenant_id` is required. Only
+returns providers with `state` `"enabled"` or `"test"` (a `"disabled"`
+provider is still reachable directly via `GET /providers/<uuid>/`, just not
+listed here - mirrors Odoo's own "don't show a switched-off provider to a
+customer" filtering). Response never includes credential fields.
 
 ```bash
 curl "http://localhost:8000/providers/?tenant_id=<tenant-uuid>"
 ```
+
+Add `&currency=<code>` to only get back providers that support a given
+currency (case-insensitive - `?currency=usd` and `?currency=USD` behave the
+same):
+
+```bash
+curl "http://localhost:8000/providers/?tenant_id=<tenant-uuid>&currency=USD"
+```
+
+**Important: this is NOT backed by a database field.** Which currencies a
+provider supports is a hardcoded constant living in that provider's own
+adapter code - `payments_stripe/const.py` and `payments_adyen/const.py`
+each export a `SUPPORTED_CURRENCIES` list, and
+`StripeAdapter`/`AdyenAdapter.get_supported_currencies()` (in each app's
+`services.py`) just return it. This mirrors Odoo's actual
+`payment.provider._get_supported_currencies()`, which is a *method*
+individual provider modules override in code, not a field a merchant
+configures per record - there's no equivalent input on `POST /providers/`
+or `PATCH /providers/{id}/`, and there never will be one; every tenant
+using `"stripe"` gets the exact same supported-currency list as every other
+tenant using `"stripe"`.
+
+**To add support for a currency**, edit the relevant adapter's `const.py`
+directly (e.g. add `"CHF"` to `payments_stripe/const.py`'s
+`SUPPORTED_CURRENCIES` list) - that's the one place this needs to change,
+and it takes effect for every tenant using that provider immediately (no
+migration, no per-tenant update needed).
+
+Filtering logic: a provider matches a `currency` filter if its adapter's
+`get_supported_currencies()` returns `None` (the base/default behavior -
+"no restriction, supports every currency") or a list that contains the
+given code. Since there's no database column to filter on, this can't be
+done with a SQL `WHERE` clause - `ProviderListCreateView.get()` fetches the
+tenant's (state-filtered) providers first, then checks each one's adapter
+in plain Python. Note: `POST /payments/` does NOT currently re-check
+currency compatibility itself (see the `# TODO` comment near
+`PaymentCreateView` in `payments_core/views.py`) - it relies on only ever
+being called with a provider a caller already picked from this
+currency-filtered list.
 
 ### Get one provider
 

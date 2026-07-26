@@ -7,6 +7,8 @@ from payments_core.exceptions import PaymentProviderRequestError
 from payments_core.interfaces import PaymentProviderAdapter
 from payments_core.utils import send_provider_api_request, to_major_currency_units, to_minor_currency_units
 
+from . import const
+
 # Importing payments_core.models at the top of this file is safe (does not
 # create a circular import) for the same reason it's safe in
 # payments_stripe/services.py - see that file's comment on this same
@@ -169,13 +171,24 @@ class AdyenAdapter(PaymentProviderAdapter):
     (payments_core/interfaces.py). Same "must override every abstract
     method to even be instantiable" rule applies here as it does for
     StripeAdapter - see that class's docstring in
-    payments_stripe/services.py for the full explanation.
+    payments_stripe/services.py for the full explanation (including the
+    one non-abstract exception, get_supported_currencies, overridden below).
 
     Phase 2 implements the "online_redirect" flow only:
     get_specific_processing_values() (calls Adyen's /payments endpoint
     directly, via `requests`) and send_payment_request() (a thin wrapper
     around it). Every other method below is still a stub.
     """
+
+    def get_supported_currencies(self):
+        """
+        Mirrors Odoo's payment_adyen module overriding
+        payment.provider._get_supported_currencies() - same rationale as
+        StripeAdapter.get_supported_currencies in
+        payments_stripe/services.py. The actual list of codes lives in
+        payments_adyen/const.py.
+        """
+        return const.SUPPORTED_CURRENCIES
 
     def get_specific_processing_values(self, transaction):
         """

@@ -11,6 +11,8 @@ from payments_core.utils import (
     to_minor_currency_units,
 )
 
+from . import const
+
 # Importing payments_core.models at the TOP of this file (rather than
 # lazily inside a function, the way payments_core/models.py has to import
 # US) is safe here and does NOT create a circular import: payments_core's
@@ -86,11 +88,14 @@ def get_feature_support_fields(provider):
 class StripeAdapter(PaymentProviderAdapter):
     """
     Stripe's implementation of the PaymentProviderAdapter contract
-    (payments_core/interfaces.py). PaymentProviderAdapter is an ABC with
-    every method marked @abstractmethod, so Python won't even let us
-    instantiate this class unless every single one of those methods is
-    overridden below - that's true even for the methods we're only
-    stubbing out this phase.
+    (payments_core/interfaces.py). Almost every method there is marked
+    @abstractmethod, so Python won't even let us instantiate this class
+    unless every one of THOSE is overridden below - that's true even for
+    the methods we're only stubbing out this phase. The one exception is
+    get_supported_currencies, which has a real default on the base class
+    (see its comment in interfaces.py) - we override it below anyway,
+    since Stripe's supported currencies differ from that "no restriction"
+    default.
 
     Phase 2 implements the "online_redirect" flow only:
     get_specific_processing_values() (creates a real Stripe Checkout
@@ -98,6 +103,19 @@ class StripeAdapter(PaymentProviderAdapter):
     other method below is still a stub - see its docstring for which phase
     implements it for real.
     """
+
+    def get_supported_currencies(self):
+        """
+        Mirrors Odoo's payment_stripe module overriding
+        payment.provider._get_supported_currencies() - see
+        PaymentProviderAdapter.get_supported_currencies in
+        payments_core/interfaces.py for the full explanation of why this
+        override pattern exists (a hardcoded, per-adapter constant instead
+        of a database field). The actual list of codes lives in
+        payments_stripe/const.py, not here, so extending Stripe's supported
+        currencies later only ever means editing that one file.
+        """
+        return const.SUPPORTED_CURRENCIES
 
     def get_specific_processing_values(self, transaction):
         """

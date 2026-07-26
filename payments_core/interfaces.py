@@ -116,3 +116,39 @@ class PaymentProviderAdapter(ABC):
         raise NotImplementedError(
             "extract_token_values is implemented per-adapter in Phase 3"
         )
+
+    # ------------------------------------------------------------------
+    # get_supported_currencies is deliberately NOT decorated with
+    # @abstractmethod, unlike every method above. Every other method here
+    # represents something an adapter MUST actively implement to do
+    # anything useful (there's no sensible default for "how do I send a
+    # payment request"). This one is different: Odoo's own
+    # payment.provider._get_supported_currencies() has a real, useful BASE
+    # behavior - "if a provider doesn't say otherwise, assume it supports
+    # every currency" - and individual provider modules override it only
+    # when they need to restrict that. We mirror the same shape: this
+    # concrete method IS that base/default behavior, inherited as-is by any
+    # adapter that doesn't need to restrict its currencies, and overridden
+    # by ones that do (see StripeAdapter.get_supported_currencies /
+    # AdyenAdapter.get_supported_currencies for real overrides).
+    # ------------------------------------------------------------------
+    def get_supported_currencies(self):
+        """
+        Return the list of ISO 4217 currency codes this adapter supports.
+
+        Mirrors Odoo's PaymentProvider._get_supported_currencies(). The
+        default behavior (this base implementation, used by any adapter
+        that doesn't override it) is to support ALL currencies - we
+        represent "no restriction" as `None` here rather than returning
+        some impossibly long exhaustive list of every currency in
+        existence. This is the same null-means-unrestricted convention
+        you'd reach for on a database field too (see
+        ProviderListCreateView's currency filter in payments_core/views.py
+        for exactly how `None` is treated there) - it just lives in code,
+        as a method's return value, instead of in a column, because WHICH
+        currencies a provider supports is a property of the adapter's own
+        integration code here, not something a tenant configures per row.
+        Adapters that only support a specific subset should override this
+        and return an explicit list instead.
+        """
+        return None

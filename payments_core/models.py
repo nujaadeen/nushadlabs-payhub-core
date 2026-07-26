@@ -12,18 +12,24 @@ from .exceptions import PaymentProviderRequestError
 logger = logging.getLogger(__name__)
 
 
-def _get_adapter_for_provider_code(provider_code):
+def get_adapter_for_provider_code(provider_code):
     """
     Looks up and instantiates the PaymentProviderAdapter subclass matching
     `provider_code`. This is a module-level function (not a method) because
-    it's needed from TWO different places that don't both have a
-    transaction instance to work with:
+    it's needed from places that don't have a transaction instance to work
+    with:
       - PaymentTransaction._get_adapter() (an instance method) - when we
         already have a transaction and want ITS provider's adapter.
       - PaymentTransaction._search_by_reference() (a classmethod) - called
         BEFORE we've found a transaction at all (finding one IS the whole
         point of that method), so there's no `self.provider.code` to read.
-    Rather than duplicate this if/elif in both places, it lives here once.
+      - ProviderListCreateView.get() (payments_core/views.py) - filtering
+        GET /providers/ by currency needs to ask each provider's adapter
+        what currencies it supports, with only a `code` string on hand.
+    Rather than duplicate this if/elif in each place, it lives here once.
+    No leading underscore (unlike most of this file's other helpers) -
+    since it's called from another module now (views.py), it's part of
+    this module's public surface, not a private implementation detail.
 
     In Odoo, this dispatch happens implicitly via `_inherit`: each provider
     module (payment_stripe, payment_adyen) patches its own version of
@@ -405,11 +411,11 @@ class PaymentTransaction(models.Model):
     def _get_adapter(self):
         """
         Instance-method convenience wrapper around the module-level
-        _get_adapter_for_provider_code() (see its docstring near the top of
+        get_adapter_for_provider_code() (see its docstring near the top of
         this file for the full explanation of this dispatch pattern) -
         reads the provider code off THIS transaction's own provider.
         """
-        return _get_adapter_for_provider_code(self.provider.code)
+        return get_adapter_for_provider_code(self.provider.code)
 
     def _get_specific_processing_values(self):
         """
@@ -484,7 +490,7 @@ class PaymentTransaction(models.Model):
         Mirrors Odoo's payment.transaction._search_by_reference().
 
         Dispatches to the adapter matching `provider_code` (via the
-        module-level _get_adapter_for_provider_code() near the top of this
+        module-level get_adapter_for_provider_code() near the top of this
         file - NOT the instance method _get_adapter(), since this is a
         classmethod: there's no transaction instance yet to read a provider
         code off of - finding one IS the whole point of this method). Each
@@ -493,7 +499,7 @@ class PaymentTransaction(models.Model):
         AdyenAdapter.search_by_reference).
         """
         try:
-            adapter = _get_adapter_for_provider_code(provider_code)
+            adapter = get_adapter_for_provider_code(provider_code)
         except PaymentProviderRequestError:
             logger.warning(
                 "_search_by_reference: no adapter registered for provider_code '%s'.",

@@ -20,7 +20,7 @@ from payments_stripe.services import (
 from tenants.models import Customer
 
 from .exceptions import PaymentProviderRequestError
-from .models import PaymentProvider, PaymentTransaction
+from .models import PaymentProvider, PaymentTransaction, get_adapter_for_provider_code
 from .serializers import (
     PaymentProviderCreateSerializer,
     PaymentProviderReadSerializer,
@@ -67,9 +67,57 @@ class ProviderListCreateView(APIView):
         # QuerySets are lazy - .filter() below doesn't hit the database yet,
         # it just builds up a SQL query description. The database is only
         # actually queried once we do something that needs the results,
-        # which happens inside the serializer when it iterates over
-        # `providers` to build the response list.
-        providers = PaymentProvider.objects.filter(tenant_id=tenant_id)
+        # which happens below when we iterate over `providers` to apply
+        # the currency filter (or, if there's no currency param, once the
+        # serializer iterates over it to build the response list).
+        #
+        # state__in=["enabled", "test"]: mirrors Odoo's own
+        # _get_compatible_providers filtering - a "disabled" provider is one
+        # a tenant configured but switched off, and shouldn't show up on a
+        # customer-facing payment page at all (it's still visible/editable
+        # via GET/PATCH /providers/{id}/ directly by id, just not listed
+        # here alongside the providers a customer could actually pay with).
+        providers = PaymentProvider.objects.filter(
+            tenant_id=tenant_id, state__in=["enabled", "test"]
+        )
+
+        currency = request.query_params.get("currency")
+        if currency:
+            currency = currency.upper()
+            # Which currencies a provider supports is NOT a database field
+            # on PaymentProvider - it's a hardcoded constant living in each
+            # adapter's own code (see payments_stripe/const.py,
+            # payments_adyen/const.py), read via
+            # adapter.get_supported_currencies() - exactly mirroring Odoo's
+            # payment.provider._get_supported_currencies(), which is a
+            # method individual provider modules override, not something a
+            # merchant configures per record. That means we CAN'T filter
+            # this with a SQL WHERE clause the way state__in above does -
+            # there's nothing in the payment_core_paymentprovider TABLE to
+            # query against. Instead, we fetch the tenant's (already
+            # state-filtered) providers first, then - in plain Python - ask
+            # EACH one's adapter what currencies it supports, and keep only
+            # the matching ones. This is strictly less efficient than a
+            # DB-level filter (it can't be pushed down into the query, and
+            # wouldn't scale to thousands of providers) but is the right
+            # trade-off here: a tenant realistically has a handful of
+            # providers, and this mirrors Odoo's own architecture, where
+            # currency support is also just Python code that runs after
+            # providers are loaded, not a SQL-level filter.
+            matching_providers = []
+            for provider in providers:
+                adapter = get_adapter_for_provider_code(provider.code)
+                supported_currencies = adapter.get_supported_currencies()
+                if supported_currencies is None:
+                    # None means "no restriction" (see
+                    # PaymentProviderAdapter.get_supported_currencies in
+                    # interfaces.py) - include this provider regardless of
+                    # which currency was requested.
+                    matching_providers.append(provider)
+                elif currency in (code.upper() for code in supported_currencies):
+                    matching_providers.append(provider)
+            providers = matching_providers
+
         serializer = PaymentProviderReadSerializer(providers, many=True)
         return Response(serializer.data)
 
@@ -197,6 +245,15 @@ class PaymentCreateView(APIView):
                 {"amount": f"Amount must be at most {provider.maximum_amount}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # TODO: consider validating currency compatibility at POST
+        # /payments/ time too (against provider.get_supported_currencies()
+        # - see ProviderListCreateView.get's currency filter, which uses
+        # the same adapter method). Not implemented here yet: a real
+        # frontend would only ever show a customer providers that already
+        # support their chosen currency (via that GET
+        # /providers/?currency= filter), so this endpoint doesn't currently
+        # double-check it too.
 
         customer = get_object_or_404(
             Customer, pk=data["customer_id"], tenant_id=data["tenant_id"]
