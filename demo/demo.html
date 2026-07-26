@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PayHub Demo</title>
+<style>
+  /* Minimal styling for readability only - this is a manual testing tool,
+     not a real frontend, so no design effort beyond "easy to read". */
+  body { font-family: sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  section { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin-bottom: 1.5rem; }
+  h2 { margin-top: 0; }
+  label { display: block; margin-top: 0.6rem; font-weight: bold; }
+  input, select { display: block; width: 100%; padding: 0.4rem; margin-top: 0.2rem; box-sizing: border-box; }
+  button { margin-top: 0.8rem; padding: 0.5rem 1rem; cursor: pointer; }
+  pre { background: #f5f5f5; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+  #idsPanel { font-size: 0.85rem; color: #333; background: #fafafa; padding: 0.5rem 0.75rem; border-radius: 4px; white-space: pre-wrap; }
+  .hidden { display: none; }
+  .note { font-size: 0.9rem; color: #555; }
+</style>
+</head>
+<body>
+
+<h1>PayHub Demo</h1>
+<p class="note">
+  Manual testing tool for the payhub-core API - plain HTML + <code>fetch()</code>, no framework,
+  no build step. This page is served completely separately from Django (see demo/README.md); it
+  talks to the real API purely over HTTP from the browser. Every response is shown as raw JSON
+  in the box under each step.
+</p>
+
+<p>
+  <strong>Saved IDs</strong> (persisted in <code>localStorage</code> - see the comment on
+  <code>STORAGE_KEY</code> below for why):
+</p>
+<div id="idsPanel"></div>
+<button id="resetStateBtn">Reset all saved IDs</button>
+
+<section id="step1">
+  <h2>Step 1 &mdash; Create Tenant</h2>
+  <form id="tenantForm">
+    <label for="tenantName">Name</label>
+    <input type="text" id="tenantName" value="Acme Inc" required>
+    <button type="submit">Create Tenant</button>
+  </form>
+  <pre id="tenantResult"></pre>
+</section>
+
+<section id="step2">
+  <h2>Step 2 &mdash; Create Customer</h2>
+  <p class="note">Uses the tenant id saved from Step 1.</p>
+  <form id="customerForm">
+    <label for="customerReference">Reference (the customer's external id, e.g. from your own system)</label>
+    <input type="text" id="customerReference" value="demo-customer-1" required>
+    <button type="submit">Create Customer</button>
+  </form>
+  <pre id="customerResult"></pre>
+</section>
+
+<section id="step3">
+  <h2>Step 3 &mdash; Onboard a Provider</h2>
+  <p class="note">Uses the tenant id from Step 1. No "supported currencies" field here on
+  purpose - which currencies a provider supports is a hardcoded constant in that adapter's own
+  code (payments_stripe/const.py, payments_adyen/const.py), not something set per provider via
+  the API.</p>
+  <form id="providerForm">
+    <label for="providerCode">Code</label>
+    <select id="providerCode">
+      <option value="stripe">stripe</option>
+      <option value="adyen">adyen</option>
+    </select>
+
+    <label for="providerName">Name</label>
+    <input type="text" id="providerName" value="My Stripe Account" required>
+
+    <div id="stripeFields">
+      <label for="stripePublishableKey">stripe_config.publishable_key</label>
+      <input type="text" id="stripePublishableKey" value="pk_test_123">
+      <label for="stripeSecretKey">stripe_config.secret_key</label>
+      <input type="text" id="stripeSecretKey" value="sk_test_123">
+      <label for="stripeWebhookSecret">stripe_config.webhook_secret</label>
+      <input type="text" id="stripeWebhookSecret" value="whsec_123">
+    </div>
+
+    <div id="adyenFields" class="hidden">
+      <label for="adyenMerchantAccount">adyen_config.merchant_account</label>
+      <input type="text" id="adyenMerchantAccount" value="MA123">
+      <label for="adyenApiKey">adyen_config.api_key</label>
+      <input type="text" id="adyenApiKey" value="ak_123">
+      <label for="adyenClientKey">adyen_config.client_key</label>
+      <input type="text" id="adyenClientKey" value="ck_123">
+      <label for="adyenHmacKey">adyen_config.hmac_key</label>
+      <input type="text" id="adyenHmacKey" value="hk_123">
+    </div>
+
+    <button type="submit">Create Provider</button>
+  </form>
+  <pre id="providerResult"></pre>
+
+  <p class="note">Providers start out <code>"disabled"</code> (see <code>PaymentProvider.state</code>)
+  and can't process payments until switched to <code>"test"</code> or <code>"enabled"</code>.
+  This is a separate, explicit action rather than something Step 3's create does silently:</p>
+  <button id="activateProviderBtn" disabled>Activate Provider (set to test mode)</button>
+  <pre id="activateResult"></pre>
+</section>
+
+<section id="step4">
+  <h2>Step 4 &mdash; List Providers for Currency</h2>
+  <p class="note">Uses the tenant id from Step 1. Only returns providers with
+  state "enabled" or "test" that support the given currency (or place no
+  restriction on currency at all).</p>
+  <form id="listProvidersForm">
+    <label for="listCurrency">Currency</label>
+    <input type="text" id="listCurrency" value="USD" required>
+    <button type="submit">List Providers</button>
+  </form>
+  <div id="providerChoices"></div>
+  <pre id="listProvidersResult"></pre>
+</section>
+
+<section id="step5">
+  <h2>Step 5 &mdash; Create Payment Transaction</h2>
+  <p class="note">Uses the tenant id, customer id, and whichever provider is selected (radio
+  button) in Step 4.</p>
+  <form id="paymentForm">
+    <label for="paymentAmount">Amount</label>
+    <input type="text" id="paymentAmount" value="25.00" required>
+
+    <label for="paymentCurrency">Currency</label>
+    <input type="text" id="paymentCurrency" required>
+
+    <label for="paymentReturnUrl">Return URL</label>
+    <input type="text" id="paymentReturnUrl" required>
+    <p class="note">
+      <!--
+        Why this is pre-filled WITHOUT a "?step=return" (or any other) query
+        string, unlike a naive first guess: both StripeAdapter and
+        AdyenAdapter (payments_stripe/services.py, payments_adyen/services.py)
+        unconditionally build success_url/returnUrl as
+        f"{transaction.return_url}?reference={transaction.reference}" - they
+        ALWAYS append "?reference=..." themselves. If OUR return_url already
+        had its own "?something=..." on it, the result would be a malformed
+        URL with two "?" characters (".../demo.html?step=return?reference=abc"),
+        which browsers parse as ONE query string - "reference" would end up
+        buried inside the value of "step" instead of being its own readable
+        param. So we deliberately keep this URL clean (no query string at
+        all) and detect "we've come back from a redirect" in Step 6 by
+        checking for the "reference" param the adapters themselves add -
+        see the script at the bottom of this file.
+      -->
+      Deliberately has no query string of its own - see the code comment on
+      this field in the page source for why (short version: Stripe/Adyen
+      always append their own <code>?reference=...</code>, and stacking a
+      second <code>?...</code> on top of that would break in the browser).
+    </p>
+
+    <button type="submit">Create Payment</button>
+  </form>
+  <pre id="paymentResult"></pre>
+  <button id="goToProviderBtn" class="hidden">Go to Stripe/Adyen to complete payment</button>
+</section>
+
+<section id="step6">
+  <h2>Step 6 &mdash; Handle Return</h2>
+  <p id="returnDetected" class="hidden note">
+    This page's URL currently has a <code>reference</code> query param - looks like you've just
+    come back from a Stripe/Adyen redirect.
+  </p>
+  <button id="checkStatusBtn">Check Payment Status</button>
+  <p id="stateLine"><strong></strong></p>
+  <pre id="statusResult"></pre>
+</section>
+
+<script>
+  // Single place to change the API's base URL, per the project's own
+  // convention (see other examples in the README).
+  const API_BASE = "http://localhost:8000";
+
+  // --- Persisted state ---
+  // Step 5 sends the customer's browser away entirely (window.location.href
+  // = redirect_url, to Stripe's/Adyen's own hosted page) and Stripe/Adyen
+  // later sends it back to OUR return_url - that's a full page navigation,
+  // which throws away every plain JS variable this script had (the page,
+  // and this whole <script> block, gets reloaded from scratch). localStorage
+  // is tied to the browser ORIGIN, not to one page load, so it's what
+  // survives that round trip - we stash every id we'll need later in there
+  // instead of relying on JS variables alone, and reload them back out
+  // the moment this script runs again after the redirect.
+  const STORAGE_KEY = "payhubDemoState";
+
+  function loadDemoState() {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  }
+
+  function saveDemoState(partial) {
+    const merged = { ...loadDemoState(), ...partial };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+    renderIdsPanel(merged);
+    return merged;
+  }
+
+  function renderIdsPanel(demoState) {
+    document.getElementById("idsPanel").textContent = JSON.stringify(demoState, null, 2);
+  }
+
+  let demoState = loadDemoState();
+  renderIdsPanel(demoState);
+
+  document.getElementById("resetStateBtn").addEventListener("click", () => {
+    localStorage.removeItem(STORAGE_KEY);
+    demoState = {};
+    renderIdsPanel(demoState);
+  });
+
+  // --- Generic fetch() helper + response display ---
+  async function callApi(method, path, body) {
+    try {
+      const response = await fetch(API_BASE + path, {
+        method,
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (parseError) {
+        // Not every response has a JSON body (e.g. a network-level error
+        // page) - don't let that crash the demo, just show nothing where
+        // the parsed body would go.
+      }
+      return { ok: response.ok, status: response.status, data };
+    } catch (networkError) {
+      // fetch() itself REJECTS (rather than resolving with some HTTP
+      // status) when the request can't even reach the server - e.g. the
+      // Django dev server isn't running, or the browser's CORS policy
+      // blocked the request before any response came back at all. Since
+      // demo.html (http://localhost:8080) and Django (http://localhost:8000)
+      // are different origins as far as the browser is concerned, this is
+      // a realistic thing to hit here - if you see "network error" below,
+      // check the browser's dev console; if it says something about CORS,
+      // see demo/README.md's note on it (short version: this project
+      // hasn't needed django-cors-headers for anything else yet, so it's
+      // deliberately not installed unless this demo page actually needs it).
+      return { ok: false, status: "network error", data: { error: networkError.message } };
+    }
+  }
+
+  function showResult(preId, result) {
+    document.getElementById(preId).textContent =
+      "HTTP " + result.status + "\n" + JSON.stringify(result.data, null, 2);
+  }
+
+  // --- Step 1: Create Tenant ---
+  document.getElementById("tenantForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const name = document.getElementById("tenantName").value;
+    const result = await callApi("POST", "/tenants/", { name });
+    showResult("tenantResult", result);
+    if (result.ok) {
+      demoState = saveDemoState({ tenantId: result.data.id });
+    }
+  });
+
+  // --- Step 2: Create Customer ---
+  document.getElementById("customerForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!demoState.tenantId) {
+      alert("Create a tenant in Step 1 first.");
+      return;
+    }
+    const reference = document.getElementById("customerReference").value;
+    const result = await callApi("POST", "/customers/", {
+      tenant: demoState.tenantId,
+      reference,
+    });
+    showResult("customerResult", result);
+    if (result.ok) {
+      demoState = saveDemoState({ customerId: result.data.id });
+    }
+  });
+
+  // --- Step 3: Onboard a Provider ---
+  const providerCodeSelect = document.getElementById("providerCode");
+  const stripeFields = document.getElementById("stripeFields");
+  const adyenFields = document.getElementById("adyenFields");
+
+  providerCodeSelect.addEventListener("change", () => {
+    const isStripe = providerCodeSelect.value === "stripe";
+    stripeFields.classList.toggle("hidden", !isStripe);
+    adyenFields.classList.toggle("hidden", isStripe);
+  });
+
+  document.getElementById("providerForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!demoState.tenantId) {
+      alert("Create a tenant in Step 1 first.");
+      return;
+    }
+
+    const code = providerCodeSelect.value;
+    const body = {
+      tenant_id: demoState.tenantId,
+      code,
+      name: document.getElementById("providerName").value,
+    };
+    if (code === "stripe") {
+      body.stripe_config = {
+        publishable_key: document.getElementById("stripePublishableKey").value,
+        secret_key: document.getElementById("stripeSecretKey").value,
+        webhook_secret: document.getElementById("stripeWebhookSecret").value,
+      };
+    } else {
+      body.adyen_config = {
+        merchant_account: document.getElementById("adyenMerchantAccount").value,
+        api_key: document.getElementById("adyenApiKey").value,
+        client_key: document.getElementById("adyenClientKey").value,
+        hmac_key: document.getElementById("adyenHmacKey").value,
+      };
+    }
+
+    const result = await callApi("POST", "/providers/", body);
+    showResult("providerResult", result);
+    if (result.ok) {
+      demoState = saveDemoState({ providerId: result.data.id });
+      document.getElementById("activateProviderBtn").disabled = false;
+    }
+  });
+
+  document.getElementById("activateProviderBtn").addEventListener("click", async () => {
+    if (!demoState.providerId) {
+      alert("Create a provider first.");
+      return;
+    }
+    const result = await callApi("PATCH", `/providers/${demoState.providerId}/`, {
+      state: "test",
+    });
+    showResult("activateResult", result);
+  });
+
+  // --- Step 4: List Providers for Currency ---
+  document.getElementById("listProvidersForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!demoState.tenantId) {
+      alert("Create a tenant in Step 1 first.");
+      return;
+    }
+    const currency = document.getElementById("listCurrency").value.toUpperCase();
+    const query =
+      "?tenant_id=" + encodeURIComponent(demoState.tenantId) +
+      "&currency=" + encodeURIComponent(currency);
+    const result = await callApi("GET", "/providers/" + query);
+    showResult("listProvidersResult", result);
+    demoState = saveDemoState({ currency });
+    // Also update Step 5's currency field LIVE, right now - the pre-fill
+    // near the bottom of this script only runs once, when the page first
+    // loads (from whatever was already in localStorage from an EARLIER
+    // page load), so without this line, picking a currency here wouldn't
+    // show up in Step 5 until you reloaded the whole page.
+    document.getElementById("paymentCurrency").value = currency;
+
+    const choicesDiv = document.getElementById("providerChoices");
+    choicesDiv.innerHTML = "";
+    if (result.ok && Array.isArray(result.data)) {
+      result.data.forEach((provider) => {
+        const label = document.createElement("label");
+        label.style.fontWeight = "normal";
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "selectedProvider";
+        radio.value = provider.id;
+        radio.addEventListener("change", () => {
+          demoState = saveDemoState({ providerId: provider.id });
+        });
+        label.appendChild(radio);
+        label.append(
+          " " + provider.name + " (code: " + provider.code + ", id: " + provider.id + ")"
+        );
+        choicesDiv.appendChild(label);
+      });
+    }
+  });
+
+  // --- Step 5: Create Payment Transaction ---
+  // Pre-fill return_url once, on page load - see the HTML comment next to
+  // the #paymentReturnUrl input above for why this has no query string.
+  document.getElementById("paymentReturnUrl").value =
+    window.location.origin + window.location.pathname;
+  if (demoState.currency) {
+    document.getElementById("paymentCurrency").value = demoState.currency;
+  }
+
+  document.getElementById("paymentForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!demoState.tenantId || !demoState.customerId || !demoState.providerId) {
+      alert("Need a tenant (Step 1), a customer (Step 2), and a selected provider (Step 3 or 4) first.");
+      return;
+    }
+
+    const body = {
+      tenant_id: demoState.tenantId,
+      provider_id: demoState.providerId,
+      customer_id: demoState.customerId,
+      amount: document.getElementById("paymentAmount").value,
+      currency: document.getElementById("paymentCurrency").value.toUpperCase(),
+      return_url: document.getElementById("paymentReturnUrl").value,
+    };
+    const result = await callApi("POST", "/payments/", body);
+    showResult("paymentResult", result);
+
+    const goBtn = document.getElementById("goToProviderBtn");
+    if (result.ok) {
+      // Stash the transaction id NOW, before any redirect happens - see
+      // the STORAGE_KEY comment above for why this can't just live in a
+      // JS variable.
+      demoState = saveDemoState({ transactionId: result.data.id });
+
+      if (result.data.redirect_url) {
+        goBtn.classList.remove("hidden");
+        goBtn.onclick = () => {
+          window.location.href = result.data.redirect_url;
+        };
+      } else {
+        // Adyen's immediate-processing case (see AdyenAdapter.
+        // get_specific_processing_values) - no redirect_url, the
+        // transaction's final state is already right there in
+        // result.data.state, nothing further to send the customer to.
+        goBtn.classList.add("hidden");
+      }
+    }
+  });
+
+  // --- Step 6: Handle Return ---
+  // Detect "we've just come back from Stripe/Adyen" by checking for the
+  // "reference" query param - NOT a "?step=return" marker (see the comment
+  // on #paymentReturnUrl above for why we don't add our own query string
+  // to return_url in the first place). Both adapters always add
+  // "?reference=<our reference>" themselves when redirecting back, so its
+  // presence alone is a reliable signal, without us needing to invent
+  // anything extra.
+  const returnParams = new URLSearchParams(window.location.search);
+  if (returnParams.has("reference")) {
+    document.getElementById("returnDetected").classList.remove("hidden");
+  }
+
+  document.getElementById("checkStatusBtn").addEventListener("click", async () => {
+    if (!demoState.transactionId) {
+      alert("No transaction id saved yet - create a payment in Step 5 first.");
+      return;
+    }
+    const result = await callApi("GET", `/payments/${demoState.transactionId}/`);
+    showResult("statusResult", result);
+    document.querySelector("#stateLine strong").textContent =
+      result.ok ? "Current state: " + result.data.state : "";
+  });
+</script>
+
+</body>
+</html>
