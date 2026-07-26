@@ -1,0 +1,16 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Django
+db.sqlite3
+*.log
+
+# Editors
+.vscode/
+.idea/
