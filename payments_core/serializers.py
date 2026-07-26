@@ -6,7 +6,7 @@ from payments_adyen.models import PaymentProviderAdyenConfig
 from payments_stripe import services as stripe_services
 from payments_stripe.models import PaymentProviderStripeConfig
 
-from .models import PaymentProvider
+from .models import PaymentProvider, PaymentTransaction
 
 # The request body uses short, generic key names (e.g. "publishable_key")
 # but the actual database columns are prefixed per-adapter (e.g.
@@ -274,3 +274,55 @@ class PaymentProviderUpdateSerializer(serializers.ModelSerializer):
                 config.save()
 
         return instance
+
+
+class PaymentTransactionCreateSerializer(serializers.Serializer):
+    """
+    Handles the INPUT side of POST /payments/.
+
+    Plain DRF `Serializer` (not `ModelSerializer`) on purpose: the actual
+    row-creation-then-external-call-then-update flow for this endpoint is
+    deliberately spread across several explicit steps in the view (see
+    PaymentCreateView.post() in views.py) rather than being
+    collapsed into a single serializer.save() the way our provider
+    serializers do it - because, unlike a provider, creating a
+    PaymentTransaction here involves an external HTTP call to Stripe/Adyen
+    in between two separate database writes, which shouldn't be hidden
+    inside one .save() call (see that view for the full explanation of why).
+    This serializer's only job is validating the shape of the input.
+    """
+
+    tenant_id = serializers.UUIDField()
+    provider_id = serializers.UUIDField()
+    customer_id = serializers.UUIDField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    # min_length=3 as well as max_length=3: without min_length, "US" (2
+    # chars) would pass validation here and only fail later, confusingly,
+    # wherever the currency code actually gets used.
+    currency = serializers.CharField(min_length=3, max_length=3)
+    return_url = serializers.CharField()
+
+
+class PaymentTransactionReadSerializer(serializers.ModelSerializer):
+    """
+    Handles the OUTPUT side of GET /payments/{id}/ - the polling endpoint an
+    API caller uses to check a payment's current status. Deliberately a
+    small field list: just enough for a caller to know what's going on with
+    their payment, nothing internal (no tenant/provider/customer FKs, no
+    provider_data raw payload).
+    """
+
+    class Meta:
+        model = PaymentTransaction
+        fields = [
+            "id",
+            "reference",
+            "state",
+            "amount",
+            "currency",
+            "provider_reference",
+            "state_message",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields

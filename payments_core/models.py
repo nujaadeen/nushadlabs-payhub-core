@@ -1,8 +1,12 @@
+import re
 import uuid
 
 from django.db import models
+from django.utils import timezone
 
 from tenants.models import Customer, Tenant
+
+from .exceptions import PaymentProviderRequestError
 
 
 class PaymentProvider(models.Model):
@@ -115,6 +119,21 @@ class PaymentProvider(models.Model):
             "support_tokenization": "not_implemented",
             "support_express_checkout": "not_implemented",
         }
+
+    def _ensure_provider_is_not_disabled(self):
+        """
+        Mirrors Odoo's payment.provider._ensure_provider_is_not_disabled().
+
+        A "disabled" provider is one a tenant has configured but switched
+        off - it shouldn't be usable to create new payments, even though the
+        row (and its credentials) still exist. Odoo raises a UserError here,
+        which its web layer knows how to turn into a friendly error page; we
+        don't have that machinery, so we raise a plain ValueError instead
+        and let the calling view (POST /payments/) catch it and turn it into
+        a 400 response.
+        """
+        if self.state == "disabled":
+            raise ValueError(f"Provider '{self.name}' is disabled and cannot process payments.")
 
 
 class PaymentToken(models.Model):
@@ -253,16 +272,130 @@ class PaymentTransaction(models.Model):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _compute_reference(cls, provider_code, prefix=None, **kwargs):
+    def _compute_reference(cls, provider_code, tenant_id, prefix=None, separator="-", **kwargs):
         """
         Mirrors Odoo's payment.transaction._compute_reference().
 
-        Generates a unique reference string for a new transaction, optionally
-        seeded with a caller-supplied `prefix`, guaranteeing uniqueness by
-        appending a counter/suffix if the prefix is already taken.
-        Implemented in Phase 2.
+        `provider_code` is kept in the signature to match Odoo's method
+        shape (and because a future phase might want it to influence the
+        prefix), but this simplified version doesn't actually use it -
+        we skip Odoo's `_compute_reference_prefix` hook system entirely and
+        just fall back to a plain timestamp-based prefix. That's overkill
+        for a learning project with one reference-generation strategy.
+
+        Odoo's uniqueness check is GLOBAL - one payment.transaction table
+        shared by the whole Odoo database. We're multi-tenant with every
+        tenant's transactions in that same shared table, so a global
+        uniqueness check would be wrong here: two different tenants
+        creating a transaction in the same second could easily generate the
+        same "tx-<timestamp>" prefix, even though they have nothing to do
+        with each other and neither cares about the other's references. We
+        scope the uniqueness check to `tenant_id` instead - this is our
+        adaptation of Odoo's approach, not a straight copy.
         """
-        raise NotImplementedError("Implemented in Phase 2")
+        if not prefix:
+            # Odoo's own fallback prefix is built from the record's own id
+            # once it exists; a UUID pk (see PaymentTransaction.id above)
+            # doesn't give us a nice short number to use the same way, so we
+            # use a plain timestamp instead - simple, and unique enough for
+            # this project's purposes.
+            prefix = f"tx-{int(timezone.now().timestamp())}"
+
+        exact_match_exists = cls.objects.filter(tenant_id=tenant_id, reference=prefix).exists()
+        if not exact_match_exists:
+            # Nobody's using this bare prefix yet for this tenant - no
+            # suffix needed, exactly like Odoo's first-use case.
+            return prefix
+
+        # The bare prefix is already taken for this tenant - we need a
+        # "{prefix}{separator}{n}" suffix instead. We can't just count how
+        # many rows start with the prefix and add one - if a transaction
+        # was ever deleted, that count would be too low and we'd generate a
+        # reference that collides with one still in use. Instead, like
+        # Odoo, we use a regex to find the ACTUAL highest suffix number
+        # currently in use among this tenant's references, and pick one
+        # higher than that - this is correct no matter what gaps exist.
+        candidates = cls.objects.filter(
+            tenant_id=tenant_id, reference__startswith=f"{prefix}{separator}"
+        )
+        suffix_pattern = re.compile(rf"^{re.escape(prefix)}{re.escape(separator)}(\d+)$")
+        max_suffix = 0
+        for candidate in candidates:
+            match = suffix_pattern.match(candidate.reference)
+            if match:
+                max_suffix = max(max_suffix, int(match.group(1)))
+
+        return f"{prefix}{separator}{max_suffix + 1}"
+
+    def _get_processing_values(self):
+        """
+        Mirrors Odoo's payment.transaction._get_processing_values().
+
+        Builds the dict of values the API caller (and, internally, the
+        chosen adapter) needs to actually kick off a payment: our own
+        reference/amount/currency plus whatever provider-specific values
+        `_get_specific_processing_values` below returns (for this phase,
+        that includes making the real Stripe/Adyen API call and returning
+        its `redirect_url`).
+        """
+        processing_values = {
+            "provider_id": self.provider_id,
+            "provider_code": self.provider.code,
+            "reference": self.reference,
+            "amount": self.amount,
+            "currency": self.currency,
+            "customer_id": self.customer_id,
+            # TODO: Phase 3 - tokenization isn't implemented yet (see the
+            # _tokenize/_extract_token_values stubs below), so we never ask
+            # a provider to save the payment method for reuse. Always False
+            # until that phase exists.
+            "tokenize": False,
+        }
+        processing_values.update(self._get_specific_processing_values())
+        return processing_values
+
+    def _get_specific_processing_values(self):
+        """
+        Mirrors Odoo's payment.transaction._get_specific_processing_values().
+
+        In Odoo, this method is overridden per-provider: each provider
+        module (payment_stripe, payment_adyen) uses `_inherit` to patch its
+        own version of this method onto payment.transaction, and Odoo's ORM
+        automatically dispatches a call to the right override based on
+        which modules are installed. Django has no equivalent to `_inherit`
+        - there's no way for payments_stripe to "reopen" this class and add
+        a Stripe-specific version of this method. So instead we reproduce
+        the same "run the right code for this provider" behavior ourselves,
+        explicitly: look at `self.provider.code` and pick the matching
+        adapter class by hand. This if/elif is our whole "override
+        registry" - it's the one place that would grow if we added a third
+        provider.
+
+        The adapter class imports below are deliberately INSIDE this method
+        (not at the top of this file) to avoid a circular import: this file
+        (payments_core/models.py) would import payments_stripe.services,
+        which imports payments_stripe.models (for
+        PaymentProviderStripeConfig), which itself imports PaymentProvider
+        FROM payments_core.models - i.e. right back into the module that's
+        still in the middle of being defined. Python can't resolve that at
+        import time. Importing inside the method instead delays the import
+        until this method actually RUNS (by which point payments_core.models
+        has finished loading), which sidesteps the cycle entirely.
+        """
+        if self.provider.code == "stripe":
+            from payments_stripe.services import StripeAdapter
+
+            adapter = StripeAdapter()
+        elif self.provider.code == "adyen":
+            from payments_adyen.services import AdyenAdapter
+
+            adapter = AdyenAdapter()
+        else:
+            raise PaymentProviderRequestError(
+                f"No adapter registered for provider code '{self.provider.code}'."
+            )
+
+        return adapter.get_specific_processing_values(self)
 
     @classmethod
     def _process(cls, provider_code, payment_data):
@@ -335,50 +468,96 @@ class PaymentTransaction(models.Model):
         """
         raise NotImplementedError("Implemented in Phase 3")
 
+    def _update_state(self, allowed_states, target_state, state_message=None):
+        """
+        Mirrors Odoo's payment.transaction._update_state().
+
+        Odoo's version runs over a whole recordset at once: it splits the
+        records into "in an allowed source state" (which get updated) and
+        "not" (which get skipped, with a logged warning) - because a single
+        Odoo call can be asked to update many transactions together. We only
+        ever operate on one transaction instance at a time in this project,
+        so this is the same guard logic simplified down to a single record:
+        if `self.state` isn't one of the allowed source states for this
+        transition, we refuse it outright (raise) instead of silently
+        skipping it - there's no batch of "other records" to fall back to
+        updating, so silently doing nothing would just hide a bug.
+        """
+        if self.state not in allowed_states:
+            raise ValueError(
+                f"Cannot move transaction {self.reference} from state "
+                f"'{self.state}' to '{target_state}' - allowed source "
+                f"states for this transition are {allowed_states}."
+            )
+
+        self.state = target_state
+        self.state_message = state_message
+        # timezone.now() (not datetime.now()) because this project runs with
+        # USE_TZ=True (see settings.py) - Django expects/produces
+        # timezone-AWARE datetimes everywhere when that's on, and
+        # datetime.now() would give us a naive one, which triggers a
+        # RuntimeWarning and can compare incorrectly against aware datetimes
+        # elsewhere.
+        self.last_state_change = timezone.now()
+        self.save(update_fields=["state", "state_message", "last_state_change", "updated_at"])
+
     def _set_pending(self, state_message=None):
         """
         Mirrors Odoo's payment.transaction._set_pending().
 
-        Odoo's `_update_state` pattern only allows moving to "pending" from
-        specific source states (typically 'draft'). Implemented in Phase 2.
+        Allowed source state: 'draft'. A transaction can only become
+        "pending" (waiting on the customer to finish paying, or on the
+        provider to notify us of the result) right after being created -
+        this project only ever calls this once, right after a successful
+        POST /payments/ adapter call.
         """
-        raise NotImplementedError("Implemented in Phase 2")
+        self._update_state(
+            allowed_states=("draft",), target_state="pending", state_message=state_message
+        )
 
     def _set_authorized(self, state_message=None):
         """
         Mirrors Odoo's payment.transaction._set_authorized().
 
         Allowed source states (Odoo): 'draft', 'pending'. Implemented in
-        Phase 2.
+        Phase 3, once webhooks exist to actually drive this transition.
         """
-        raise NotImplementedError("Implemented in Phase 2")
+        raise NotImplementedError("Implemented in Phase 3")
 
     def _set_done(self, state_message=None):
         """
         Mirrors Odoo's payment.transaction._set_done().
 
         Allowed source states (Odoo): 'draft', 'pending', 'authorized',
-        'error'. Implemented in Phase 2.
+        'error'. Implemented in Phase 3, once webhooks exist to actually
+        drive this transition.
         """
-        raise NotImplementedError("Implemented in Phase 2")
+        raise NotImplementedError("Implemented in Phase 3")
 
     def _set_canceled(self, state_message=None):
         """
         Mirrors Odoo's payment.transaction._set_canceled().
 
         Allowed source states (Odoo): 'draft', 'pending', 'authorized'.
-        Implemented in Phase 2.
+        Implemented in Phase 3, once webhooks exist to actually drive this
+        transition.
         """
-        raise NotImplementedError("Implemented in Phase 2")
+        raise NotImplementedError("Implemented in Phase 3")
 
-    def _set_error(self, state_message=None):
+    def _set_error(self, state_message):
         """
         Mirrors Odoo's payment.transaction._set_error().
 
         Allowed source states (Odoo): any state except 'done' can move to
-        'error'. Implemented in Phase 2.
+        'error'. This phase only ever calls _set_error right after trying
+        (and failing) to create the payment request via POST /payments/, so
+        we only allow it from 'draft' or 'pending' for now - Odoo allows it
+        from more states because it has more transition paths (capture/
+        refund failures, etc.) than this project has built yet.
         """
-        raise NotImplementedError("Implemented in Phase 2")
+        self._update_state(
+            allowed_states=("draft", "pending"), target_state="error", state_message=state_message
+        )
 
     def _create_child_transaction(self, amount, is_refund=False):
         """

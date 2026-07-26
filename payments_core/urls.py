@@ -1,6 +1,11 @@
 from django.urls import path
 
-from .views import ProviderDetailView, ProviderListCreateView
+from .views import (
+    PaymentCreateView,
+    PaymentDetailView,
+    ProviderDetailView,
+    ProviderListCreateView,
+)
 
 urlpatterns = [
     path("providers/", ProviderListCreateView.as_view(), name="provider-list-create"),
@@ -10,4 +15,6 @@ urlpatterns = [
     # the URL segment isn't a valid UUID, this pattern simply doesn't match
     # (Django returns a 404 rather than passing a bad value into the view).
     path("providers/<uuid:pk>/", ProviderDetailView.as_view(), name="provider-detail"),
+    path("payments/", PaymentCreateView.as_view(), name="payment-create"),
+    path("payments/<uuid:pk>/", PaymentDetailView.as_view(), name="payment-detail"),
 ]
