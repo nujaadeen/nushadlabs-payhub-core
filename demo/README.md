@@ -56,15 +56,22 @@ if you want to start over from a clean slate.
 
 ## A note on CORS
 
-`demo.html` (served from `http://localhost:8080`) and the Django API (`http://localhost:8000`)
-are **different origins** as far as the browser is concerned, even though both say "localhost" -
-the port is part of the origin too. If your browser blocks the requests, you'll see it clearly:
-the result box for that step will show `HTTP network error` with a message from the browser (and
-usually a much more detailed CORS error in the browser's dev console).
+`demo.html` (served from e.g. `http://localhost:8080` or `http://127.0.0.1:5500`) and the Django
+API (`http://localhost:8000`) are **different origins** as far as the browser is concerned, even
+though they're all "localhost"/"127.0.0.1" - the port is part of the origin too. Without extra
+setup, the browser blocks this page's requests before Django ever sees them, which shows up as
+`HTTP network error` in the result box (and a much more detailed CORS error in the browser's dev
+console) - `Failed to fetch` on Step 1 was exactly this.
 
-If that happens, the fix is to install
-[`django-cors-headers`](https://pypi.org/project/django-cors-headers/) and allow
-`http://localhost:8080` as an allowed origin. This is **deliberately not set up already** - this
-demo page is a late, purely-additive addition to the project, and adding a CORS-handling
-dependency and settings change on the Django side isn't done unless it turns out to actually be
-necessary for your browser/setup.
+The project already handles the common cases: `django-cors-headers` is installed, and
+`CORS_ALLOWED_ORIGINS` (see `.env.example` / `settings.py`) allows both
+`http://127.0.0.1:5500`/`http://localhost:5500` (VS Code's "Live Server" extension) and
+`http://127.0.0.1:8080`/`http://localhost:8080` (`python -m http.server`, as used above) by
+default - so serving this page on either of those should just work with no further setup.
+
+**If you serve `demo.html` from a different port than those**, you'll hit the CORS block again.
+Fix it by adding your port to `CORS_ALLOWED_ORIGINS` in your own `.env` file (comma-separated, no
+spaces - see `.env.example` at the project root for the exact format) and restarting the Django
+dev server (Django only reads `.env` at startup, so a running server won't pick up the change on
+its own). The "Calling API at" label near the top of this page shows both origins involved, which
+is exactly the information you need to debug this if it comes up.

@@ -51,9 +51,47 @@ This is a portfolio/learning project, built in phases.
 - No authentication or permission classes anywhere - every endpoint is open.
 - Credential fields (Stripe/Adyen API keys) are stored as plain text, not
   encrypted.
+- `django.contrib.admin` (and `auth`/`sessions`/`messages`, which it needs)
+  is **not installed** - see "No admin app" below.
 
-Both are called out with comments at the point they matter (`settings.py`,
+These are called out with comments at the point they matter (`settings.py`,
 and on each credential field) and will be addressed in a later phase.
+
+## No admin app
+
+This project has never used Django's admin site, so `django.contrib.admin`
+- along with `django.contrib.auth`, `django.contrib.sessions`, and
+`django.contrib.messages`, which admin/auth need - has been removed from
+`INSTALLED_APPS` entirely (see the comments there in `settings.py`). Those
+apps would otherwise create tables this project never reads from
+(`auth_user`, `django_session`, `django_admin_log`, ...) on every
+`migrate`. A fresh `migrate` now only creates tables for our own apps, plus
+`django_content_type` and `django_migrations` (Django/DRF's own
+unavoidable internals - see the `INSTALLED_APPS` comment on
+`django.contrib.contenttypes` in `settings.py` for exactly why
+`contenttypes` still has to stay even though nothing in this project uses
+it directly).
+
+**If you need to inspect data during development**, use
+`python manage.py shell` or connect directly with a Postgres client (e.g.
+`psql`) - not the admin app.
+
+**If your local database predates this change** (i.e. you ran `migrate`
+before admin/auth/sessions/messages were removed), it will still have the
+old `auth_*`/`django_session`/`django_admin_log`/`django_content_type`
+tables sitting around unused. The simplest fix, since this is local
+development data: drop and recreate the database, then run `migrate`
+fresh, rather than fighting Django's migration history for apps that no
+longer exist:
+
+```bash
+dropdb <your-db-name>
+createdb <your-db-name> -O <your-db-user>
+python manage.py migrate
+```
+
+(or the equivalent `DROP DATABASE` / `CREATE DATABASE` SQL, if you set the
+database up directly through `psql` rather than `dropdb`/`createdb`).
 
 ## Project layout
 
@@ -96,6 +134,11 @@ Postgres credentials):
 ```bash
 cp .env.example .env
 ```
+
+`CORS_ALLOWED_ORIGINS` in that file already covers the common ways to
+serve `demo/demo.html` locally (VS Code "Live Server" on port 5500,
+`python -m http.server` on port 8080) - see `demo/README.md` if you're
+serving it from somewhere else.
 
 ### 4. Create the Postgres database
 

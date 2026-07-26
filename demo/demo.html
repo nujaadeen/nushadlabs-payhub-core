@@ -27,6 +27,7 @@
   talks to the real API purely over HTTP from the browser. Every response is shown as raw JSON
   in the box under each step.
 </p>
+<p id="apiBaseLabel"><strong>Calling API at:</strong> <code id="apiBaseValue"></code></p>
 
 <p>
   <strong>Saved IDs</strong> (persisted in <code>localStorage</code> - see the comment on
@@ -175,6 +176,13 @@
   // convention (see other examples in the README).
   const API_BASE = "http://localhost:8000";
 
+  // Show API_BASE (and this page's OWN origin) right on the page - makes
+  // it obvious at a glance which two origins are involved, which is
+  // exactly what you need to know to debug a CORS/connectivity problem
+  // like "Failed to fetch" (see callApi's networkError handling below).
+  document.getElementById("apiBaseValue").textContent =
+    API_BASE + "  (this page's own origin: " + window.location.origin + ")";
+
   // --- Persisted state ---
   // Step 5 sends the customer's browser away entirely (window.location.href
   // = redirect_url, to Stripe's/Adyen's own hosted page) and Stripe/Adyen
@@ -234,13 +242,12 @@
       // status) when the request can't even reach the server - e.g. the
       // Django dev server isn't running, or the browser's CORS policy
       // blocked the request before any response came back at all. Since
-      // demo.html (http://localhost:8080) and Django (http://localhost:8000)
-      // are different origins as far as the browser is concerned, this is
-      // a realistic thing to hit here - if you see "network error" below,
-      // check the browser's dev console; if it says something about CORS,
-      // see demo/README.md's note on it (short version: this project
-      // hasn't needed django-cors-headers for anything else yet, so it's
-      // deliberately not installed unless this demo page actually needs it).
+      // demo.html and Django are different origins as far as the browser
+      // is concerned (see the "Calling API at" label above - different
+      // port counts as a different origin even on the same host), this is
+      // a realistic thing to hit if the origin this page is served from
+      // isn't in the server's CORS_ALLOWED_ORIGINS - see demo/README.md
+      // for how to add it.
       return { ok: false, status: "network error", data: { error: networkError.message } };
     }
   }
@@ -248,6 +255,15 @@
   function showResult(preId, result) {
     document.getElementById(preId).textContent =
       "HTTP " + result.status + "\n" + JSON.stringify(result.data, null, 2);
+  }
+
+  // Used instead of alert() for "you're missing a prerequisite step"
+  // guards below - keeps ALL feedback in the same place every step
+  // already shows its real API responses (its own <pre> box), rather than
+  // popping up a browser dialog while silently leaving that box looking
+  // empty/broken.
+  function showMessage(preId, text) {
+    document.getElementById(preId).textContent = text;
   }
 
   // --- Step 1: Create Tenant ---
@@ -265,7 +281,7 @@
   document.getElementById("customerForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!demoState.tenantId) {
-      alert("Create a tenant in Step 1 first.");
+      showMessage("customerResult", "Create a tenant in Step 1 first.");
       return;
     }
     const reference = document.getElementById("customerReference").value;
@@ -293,7 +309,7 @@
   document.getElementById("providerForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!demoState.tenantId) {
-      alert("Create a tenant in Step 1 first.");
+      showMessage("providerResult", "Create a tenant in Step 1 first.");
       return;
     }
 
@@ -328,7 +344,7 @@
 
   document.getElementById("activateProviderBtn").addEventListener("click", async () => {
     if (!demoState.providerId) {
-      alert("Create a provider first.");
+      showMessage("activateResult", "Create a provider first.");
       return;
     }
     const result = await callApi("PATCH", `/providers/${demoState.providerId}/`, {
@@ -341,7 +357,7 @@
   document.getElementById("listProvidersForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!demoState.tenantId) {
-      alert("Create a tenant in Step 1 first.");
+      showMessage("listProvidersResult", "Create a tenant in Step 1 first.");
       return;
     }
     const currency = document.getElementById("listCurrency").value.toUpperCase();
@@ -392,7 +408,10 @@
   document.getElementById("paymentForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!demoState.tenantId || !demoState.customerId || !demoState.providerId) {
-      alert("Need a tenant (Step 1), a customer (Step 2), and a selected provider (Step 3 or 4) first.");
+      showMessage(
+        "paymentResult",
+        "Need a tenant (Step 1), a customer (Step 2), and a selected provider (Step 3 or 4) first."
+      );
       return;
     }
 
@@ -444,7 +463,7 @@
 
   document.getElementById("checkStatusBtn").addEventListener("click", async () => {
     if (!demoState.transactionId) {
-      alert("No transaction id saved yet - create a payment in Step 5 first.");
+      showMessage("statusResult", "No transaction id saved yet - create a payment in Step 5 first.");
       return;
     }
     const result = await callApi("GET", `/payments/${demoState.transactionId}/`);

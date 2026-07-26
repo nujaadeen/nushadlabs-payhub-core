@@ -14,13 +14,14 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
-from django.contrib import admin
 from django.urls import include, path
 
 from payments_core.views import HealthCheckView
 
+# No admin/ URL here - django.contrib.admin isn't installed (see
+# INSTALLED_APPS in settings.py; this project has no auth and no admin
+# usage), so there's no admin.site.urls to wire up.
 urlpatterns = [
-    path('admin/', admin.site.urls),
     # Phase 0: confirms the project is up and wired together correctly.
     path('health/', HealthCheckView.as_view(), name='health-check'),
     # Phase 1: onboarding endpoints (POST/GET /providers/, GET/PATCH/DELETE
