@@ -22,25 +22,25 @@ urlpatterns = [
     path("providers/<uuid:pk>/", ProviderDetailView.as_view(), name="provider-detail"),
     path("payments/", PaymentCreateView.as_view(), name="payment-create"),
     path("payments/<uuid:pk>/", PaymentDetailView.as_view(), name="payment-detail"),
-    # Phase 3: webhook + redirect-return endpoints. See StripeWebhookView /
-    # AdyenWebhookView in views.py for why provider_id is embedded in the
-    # webhook URLs specifically (we have no auth, so this is how we know
-    # which tenant's webhook secret to verify against).
+    # Webhook + redirect-return endpoints.
+    #
+    # webhooks/stripe/ and webhooks/adyen/ below are FIXED, single URLs -
+    # no provider_id (or any other identifier) in the path, matching Odoo's
+    # own webhook URLs exactly (/payment/stripe/webhook,
+    # /payment/adyen/notification). An earlier version of this project put
+    # provider_id in the path here (e.g. webhooks/stripe/<uuid:provider_id>/)
+    # as a workaround for having no auth - that turned out to be
+    # unnecessary and has been removed: see StripeWebhookView/
+    # AdyenWebhookView in views.py for how we now find the right
+    # tenant/provider from the webhook's OWN payload instead (via
+    # PaymentTransaction._search_by_reference), the same way Odoo does.
     path("webhooks/stripe/return/", StripeReturnView.as_view(), name="stripe-return"),
-    path(
-        "webhooks/stripe/<uuid:provider_id>/",
-        StripeWebhookView.as_view(),
-        name="stripe-webhook",
-    ),
+    path("webhooks/stripe/", StripeWebhookView.as_view(), name="stripe-webhook"),
     path("webhooks/adyen/return/", AdyenReturnView.as_view(), name="adyen-return"),
     path(
         "webhooks/adyen/payments-details/",
         AdyenPaymentsDetailsView.as_view(),
         name="adyen-payments-details",
     ),
-    path(
-        "webhooks/adyen/<uuid:provider_id>/",
-        AdyenWebhookView.as_view(),
-        name="adyen-webhook",
-    ),
+    path("webhooks/adyen/", AdyenWebhookView.as_view(), name="adyen-webhook"),
 ]

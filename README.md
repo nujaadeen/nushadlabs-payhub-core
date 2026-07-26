@@ -536,8 +536,9 @@ curl http://localhost:8000/payments/<transaction-uuid>/
 ## API reference (Phase 3 additions)
 
 Five new endpoints, all under `/webhooks/...`. None of these need
-`tenant_id` in the request - the tenant/provider is either embedded in the
-URL (`provider_id`) or looked up via the transaction's own `reference`.
+`tenant_id` in the request - the tenant/provider is always looked up via
+the transaction's own `reference` (see "Webhook URLs are fixed" below for
+why nothing needs to be embedded in the URL either).
 
 ### Stripe return URL
 
@@ -553,10 +554,17 @@ curl "http://localhost:8000/webhooks/stripe/return/?reference=tx-1234567890"
 
 ### Stripe webhook
 
-`POST /webhooks/stripe/<provider_id>/` - the URL you configure in Stripe
-(or point the Stripe CLI at - see "Webhook setup" below). Verifies the
-`Stripe-Signature` header against that provider's `stripe_webhook_secret`
-before processing anything.
+`POST /webhooks/stripe/` - one FIXED URL (no provider id or any other
+identifier in the path) - configure this same URL in Stripe regardless of
+how many tenants/providers you have (or point the Stripe CLI at it - see
+"Webhook setup" below). Finds the matching transaction via
+`PaymentTransaction._search_by_reference` (using the event payload's own
+`client_reference_id`) FIRST, then verifies the `Stripe-Signature` header
+against THAT transaction's own provider's `stripe_webhook_secret` - see
+"Webhook URLs are fixed" below for why this works with no per-tenant URL.
+An event whose reference doesn't match any transaction is acknowledged
+with a plain `200`, not a `404` or `500` - there's nothing to do with it,
+and Stripe shouldn't be told to retry something that will never resolve.
 
 ### Adyen return URL
 
@@ -578,13 +586,50 @@ curl -X POST http://localhost:8000/webhooks/adyen/payments-details/ \
 
 ### Adyen webhook
 
-`POST /webhooks/adyen/<provider_id>/` - the URL you configure in Adyen's
-Customer Area. Verifies each notification item's own
-`additionalData.hmacSignature` against that provider's `adyen_hmac_key`
-before processing it. Always responds `"[accepted]"`, per Adyen's own
-requirement - even notification items with a bad signature or an
+`POST /webhooks/adyen/` - one FIXED URL, same rationale as the Stripe
+webhook above - configure this same URL in Adyen's Customer Area
+regardless of how many tenants/providers you have. For each notification
+item, finds the matching transaction via `_search_by_reference` (using
+that item's own `merchantReference`) FIRST, then verifies that item's own
+`additionalData.hmacSignature` against THAT transaction's provider's
+`adyen_hmac_key`. Always responds `"[accepted]"`, per Adyen's own
+requirement - items with no matching transaction, a bad signature, or an
 unrecognized event code are just skipped (and logged), not rejected with
 an error status, so Adyen doesn't endlessly retry the whole batch.
+
+## Webhook URLs are fixed
+
+`/webhooks/stripe/` and `/webhooks/adyen/` are single, fixed URLs - the
+same URL works for every tenant and every provider, with no id of any kind
+in the path. This matches Odoo's own webhook URLs exactly
+(`/payment/stripe/webhook`, `/payment/adyen/notification` are also fixed,
+single paths in Odoo).
+
+An earlier phase of this project put `provider_id` in these URLs instead
+(e.g. `/webhooks/stripe/<provider_id>/`) as a workaround for having no
+auth - the idea being "the URL tells us which tenant's secret to check
+against". That turned out to be unnecessary, and didn't match Odoo: Odoo's
+webhook handlers don't need to know the provider up front either, because
+the webhook PAYLOAD itself already carries the info needed to find it.
+Stripe's `client_reference_id` and Adyen's `merchantReference` are OUR OWN
+transaction reference (set when we created the Checkout Session / Sessions
+call), and `PaymentTransaction._search_by_reference` can already find the
+matching transaction from that alone - unchanged from Phase 3, since this
+method always worked correctly, it just wasn't being used for THIS
+purpose yet. Once the transaction is found, its `provider` foreign key
+gets you the right provider - and the right webhook secret / HMAC key to
+verify against - with nothing needed from the URL at all. See
+`StripeWebhookView`/`AdyenWebhookView` in `payments_core/views.py` for the
+full code-level explanation.
+
+One consequence worth calling out: because the URL no longer identifies a
+provider, an unrecognized/unmatched reference is now acknowledged with a
+plain `200`, not a `404` - there's genuinely nothing to distinguish "this
+reference doesn't exist" from "this reference belongs to a different,
+perfectly valid provider we just don't need to specially reject" (Stripe/
+Adyen would otherwise interpret a non-2xx as "please retry", which makes
+no sense for a reference that will never resolve). This mirrors Odoo's own
+`if not tx_sudo: return request.make_json_response("")` behavior exactly.
 
 ## Webhook setup
 
@@ -597,16 +642,24 @@ both.
 1. Install the Stripe CLI: https://docs.stripe.com/stripe-cli
 2. Log in: `stripe login` (this walks you through pairing the CLI with
    your Stripe account in a browser).
-3. Forward events to your local server, for a specific provider:
+3. Forward events to your local server - one fixed URL, not tied to any
+   particular provider (see "Webhook URLs are fixed" above):
 
    ```bash
-   stripe listen --forward-to localhost:8000/webhooks/stripe/<provider-uuid>/
+   stripe listen --forward-to localhost:8000/webhooks/stripe/
    ```
 
    The CLI prints a webhook signing secret (`whsec_...`) when it starts -
    **use that value** for the provider's `stripe_config.webhook_secret`
    (`PATCH /providers/<provider-uuid>/`), not the one from the Stripe
-   Dashboard - the CLI generates its own secret for local forwarding.
+   Dashboard - the CLI generates its own secret for local forwarding. Note
+   this is specific to `stripe listen`: it forwards every event from your
+   one logged-in Stripe test account through one local secret, so if
+   you're testing more than one provider row locally at once, they'd all
+   need that same CLI-generated secret. A real deployment would give each
+   tenant's own Stripe account its own webhook endpoint and its own
+   distinct secret, same as always - only the URL you point them at is
+   shared now, not the secret.
 4. In another terminal, create a payment (`POST /payments/`) against that
    same provider, then either:
    - Open the returned `redirect_url` in a browser and pay with a
@@ -623,10 +676,11 @@ both.
 
 1. In your Adyen Customer Area, go to **Developers -> Webhooks**, and add
    a "Standard notification" webhook pointing at
-   `http://<your-public-url>/webhooks/adyen/<provider-uuid>/` (Adyen needs
-   a publicly reachable URL - use a tunnel tool like `ngrok` for local
-   testing: `ngrok http 8000`, then use the `https://....ngrok.io` URL it
-   gives you).
+   `http://<your-public-url>/webhooks/adyen/` - one fixed URL, not tied to
+   any particular provider (see "Webhook URLs are fixed" above). Adyen
+   needs a publicly reachable URL - use a tunnel tool like `ngrok` for
+   local testing: `ngrok http 8000`, then use the `https://....ngrok.io`
+   URL it gives you.
 2. Set the webhook's **HMAC Key** - this is the SAME value you store in
    that provider's `adyen_config.hmac_key` (`PATCH /providers/<provider-uuid>/`).
    Generate one via Adyen's UI if you haven't already (the "Generate new
@@ -679,9 +733,10 @@ curl -X POST http://localhost:8000/providers/ \
 curl -X PATCH http://localhost:8000/providers/<PROVIDER_ID>/ \
   -H "Content-Type: application/json" -d '{"state": "test"}'
 
-# 5. Start forwarding Stripe webhooks to this provider (see "Webhook
-#    setup" above) - keep this running in its own terminal:
-stripe listen --forward-to localhost:8000/webhooks/stripe/<PROVIDER_ID>/
+# 5. Start forwarding Stripe webhooks - one fixed URL, works for every
+#    provider (see "Webhook URLs are fixed" above) - keep this running in
+#    its own terminal:
+stripe listen --forward-to localhost:8000/webhooks/stripe/
 
 # 6. Create a payment.
 curl -X POST http://localhost:8000/payments/ \

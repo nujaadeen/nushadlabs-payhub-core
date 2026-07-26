@@ -420,23 +420,32 @@ class StripeReturnView(APIView):
 
 class StripeWebhookView(APIView):
     """
-    Handles POST /webhooks/stripe/<uuid:provider_id>/ - mirrors Odoo's
-    Stripe webhook controller.
+    Handles POST /webhooks/stripe/ - mirrors Odoo's Stripe webhook
+    controller.
 
     # TODO: Phase 5 - guard against duplicate webhook delivery
     # re-processing the same event (Stripe retries webhooks that don't get
     # a fast 2xx response, and can also just send the same event twice -
     # see Stripe's own docs on webhook idempotency).
 
-    Design note on the URL: Odoo uses ONE shared webhook endpoint for every
-    tenant/provider, and figures out which provider a webhook belongs to
-    from the event's OWN content plus its normal auth/admin layer. We have
-    NO auth at all, so there's no other way to know "which tenant's
-    stripe_webhook_secret should I verify this against" - embedding
-    provider_id in the URL is our pragmatic stand-in for what Stripe's own
-    "Connect" webhook routing would otherwise give us. It's what lets us
-    look up the RIGHT provider's secret to verify the signature against,
-    BEFORE we trust anything in the request body.
+    Design note on the URL - this used to be
+    /webhooks/stripe/<uuid:provider_id>/, with provider_id embedded in the
+    path so we'd know up front which tenant's stripe_webhook_secret to
+    verify against, since we have no auth to derive that from. That
+    doesn't match Odoo (whose Stripe webhook URL is one FIXED path, no
+    identifier in it at all: /payment/stripe/webhook) and turned out to be
+    unnecessary: the webhook payload itself already carries our own
+    transaction reference (`client_reference_id`, set when we created the
+    Checkout Session - see StripeAdapter.get_specific_processing_values),
+    and PaymentTransaction._search_by_reference can already find the
+    matching transaction from that alone. Once we have the transaction, its
+    `provider` foreign key gets us the right provider - and its
+    stripe_webhook_secret - without needing anything from the URL at all.
+    See post() below: we now search for the transaction FIRST, using only
+    the reference embedded in the payload, and only reach for a webhook
+    secret to verify against once we know (from that transaction) which
+    provider it belongs to. This is exactly Odoo's own
+    `tx_sudo = ...._search_by_reference("stripe", data)` pattern.
 
     Django/DRF gotcha this view works around: DRF's `request.data`
     AUTO-PARSES the request body into a dict the first time you touch it -
@@ -461,27 +470,8 @@ class StripeWebhookView(APIView):
     any view in this whole project, this one included.
     """
 
-    def post(self, request, provider_id):
-        provider = get_object_or_404(PaymentProvider, pk=provider_id, code="stripe")
-
+    def post(self, request):
         raw_body = request.body  # bytes - see docstring above for why
-        # Django exposes incoming HTTP headers as request.META keys,
-        # prefixed with "HTTP_" and with dashes turned into underscores -
-        # this is how a WSGI server hands headers to Django under the hood.
-        # DRF's `request.headers` (a friendlier, case-insensitive mapping)
-        # reads the exact same underlying data and would work just as well
-        # here; request.META is what we use simply to keep this close to
-        # how Odoo's own Django-adjacent code reads headers.
-        signature_header = request.META.get("HTTP_STRIPE_SIGNATURE", "")
-
-        adapter = StripeAdapter()
-        try:
-            adapter.verify_webhook_signature(
-                raw_body, signature_header, provider.stripe_config.stripe_webhook_secret
-            )
-        except PaymentProviderRequestError as exc:
-            return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
-
         event = json.loads(raw_body)
         event_type = event.get("type")
 
@@ -495,13 +485,14 @@ class StripeWebhookView(APIView):
             # so we skip straight to acknowledging receipt instead. This is
             # a normal, expected outcome for most events Stripe sends us,
             # not an error: Stripe fans a single checkout out into several
-            # event types, and we only act on the ones we understand.
+            # event types, and we only act on the ones we understand. We
+            # haven't looked up a transaction or verified a signature yet
+            # at this point - there's nothing to protect, since we're not
+            # about to act on this payload either way.
             logger.info(
-                "Stripe webhook: received event type '%s' for provider %s - "
-                "not in HANDLED_WEBHOOK_EVENTS, acknowledging without "
-                "processing.",
+                "Stripe webhook: received event type '%s' - not in "
+                "HANDLED_WEBHOOK_EVENTS, acknowledging without processing.",
                 event_type,
-                provider_id,
             )
             return Response({"status": "received"})
 
@@ -509,14 +500,48 @@ class StripeWebhookView(APIView):
         # HANDLED_WEBHOOK_EVENTS check above guarantees this object is
         # genuinely a Checkout Session for every event type in this branch,
         # so "checkout_session" below is an accurate key name, not a
-        # misleading one - contrast with the old code (before this fix),
-        # which used this same key for EVERY event type regardless of
-        # whether the object actually was one.
+        # misleading one.
         checkout_session = event.get("data", {}).get("object", {})
         payment_data = {
             "reference": checkout_session.get("client_reference_id"),
             "checkout_session": checkout_session,
         }
+
+        # Find the transaction FIRST, using only the reference embedded in
+        # the payload - this is now the ONLY way we identify which tenant/
+        # provider this webhook belongs to (see the class docstring above).
+        # Nothing has been verified yet at this point, so this lookup is
+        # NOT itself a trust decision - it only tells us WHICH provider's
+        # secret to check the signature against next. No transaction gets
+        # mutated until that signature check (below) actually passes.
+        tx = PaymentTransaction._search_by_reference("stripe", payment_data)
+        if tx is None:
+            # Mirrors Odoo's own
+            # `if not tx_sudo: return request.make_json_response("")` -
+            # acknowledge silently rather than 404ing or raising an error.
+            # A webhook for a reference we don't recognize isn't
+            # necessarily malicious or broken (e.g. a retried event for a
+            # transaction from a wiped test database) - either way, there's
+            # nothing for us to DO with it, and Stripe shouldn't be told to
+            # retry something that will never resolve.
+            return Response({"status": "received"})
+
+        # Django exposes incoming HTTP headers as request.META keys,
+        # prefixed with "HTTP_" and with dashes turned into underscores -
+        # this is how a WSGI server hands headers to Django under the hood.
+        # DRF's `request.headers` (a friendlier, case-insensitive mapping)
+        # reads the exact same underlying data and would work just as well
+        # here; request.META is what we use simply to keep this close to
+        # how Odoo's own Django-adjacent code reads headers.
+        signature_header = request.META.get("HTTP_STRIPE_SIGNATURE", "")
+
+        adapter = StripeAdapter()
+        try:
+            adapter.verify_webhook_signature(
+                raw_body, signature_header, tx.provider.stripe_config.stripe_webhook_secret
+            )
+        except PaymentProviderRequestError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
 
         try:
             PaymentTransaction._process("stripe", payment_data)
@@ -532,7 +557,7 @@ class StripeWebhookView(APIView):
             # going to fix itself on retry, so there's no point Stripe
             # trying again.
             logger.exception(
-                "Error while processing Stripe webhook for provider %s", provider_id
+                "Error while processing Stripe webhook for transaction %s", tx.reference
             )
 
         return Response({"status": "received"})
@@ -630,21 +655,33 @@ class AdyenReturnView(APIView):
 
 class AdyenWebhookView(APIView):
     """
-    Handles POST /webhooks/adyen/<uuid:provider_id>/ - mirrors Odoo's
-    `adyen_webhook` controller.
+    Handles POST /webhooks/adyen/ - mirrors Odoo's `adyen_webhook`
+    controller.
 
     # TODO: Phase 5 - guard against duplicate webhook delivery
     # re-processing the same event.
 
-    Same design rationale for provider_id being in the URL as
-    StripeWebhookView above - see that view's docstring. We use the
-    provider looked up from the URL (fetched once, up front) to verify
-    EVERY notification item in this request against, rather than looking
-    up each item's own provider via _search_by_reference first - verifying
-    against attacker-controllable data before we've verified anything would
-    be backwards, and since Adyen delivers webhooks to a URL configured
-    PER merchant account, every item arriving at THIS url should belong to
-    THIS provider anyway.
+    Design note on the URL - this used to be
+    /webhooks/adyen/<uuid:provider_id>/, with provider_id in the path so we
+    could fetch ONE provider up front and verify every notification item in
+    the request against it. That doesn't match Odoo (whose Adyen webhook
+    URL is one FIXED path: /payment/adyen/notification) and isn't actually
+    necessary: like StripeWebhookView above, each notification item already
+    carries our own transaction reference (`merchantReference`), and
+    PaymentTransaction._search_by_reference can find the matching
+    transaction - and therefore the right provider, and the right
+    adyen_hmac_key to verify THAT item's signature against - straight from
+    the item's own content. Since Adyen batches multiple merchant accounts'
+    notifications into `notificationItems` in the same request in general,
+    looking up each item's OWN transaction individually (rather than
+    assuming they all belong to one provider fetched from the URL) is
+    actually a more correct model of Adyen's real batching behavior, not
+    just an equivalent one.
+
+    As with Stripe, this per-item lookup is NOT itself a trust decision -
+    it only tells us which provider's adyen_hmac_key to check THIS item's
+    signature against next. No transaction is mutated until that signature
+    check actually passes.
 
     Unlike Stripe (which signs the whole request body once), Adyen signs
     EACH item inside `notificationItems` individually - so there's no
@@ -656,27 +693,39 @@ class AdyenWebhookView(APIView):
     around this time).
     """
 
-    def post(self, request, provider_id):
-        provider = get_object_or_404(PaymentProvider, pk=provider_id, code="adyen")
-        hmac_key = provider.adyen_config.adyen_hmac_key
+    def post(self, request):
         adapter = AdyenAdapter()
 
         for item_wrapper in request.data.get("notificationItems", []):
             item = item_wrapper.get("NotificationRequestItem", {})
 
+            # Find the transaction for THIS item first, using its own
+            # eventCode/merchantReference (AdyenAdapter.search_by_reference
+            # already knows how to read these - unchanged from before this
+            # fix, see payments_adyen/services.py). This is what tells us
+            # which provider - and which adyen_hmac_key - to verify this
+            # item's signature against, instead of a provider_id from the
+            # URL.
+            tx = PaymentTransaction._search_by_reference("adyen", item)
+            if tx is None:
+                # search_by_reference already logs WHY (an event code we
+                # don't look up yet, or no matching reference) - nothing
+                # more to log here. Skip just this ONE item and keep
+                # processing the rest of the batch, mirroring Odoo's own
+                # `if tx_sudo:` guard - Adyen batches multiple
+                # notifications into one HTTP call, so one item with no
+                # match shouldn't stop us from processing the rest.
+                continue
+
+            hmac_key = tx.provider.adyen_config.adyen_hmac_key
+
             try:
                 adapter.verify_webhook_signature(item, hmac_key)
             except PaymentProviderRequestError:
-                # Mirrors Odoo: skip just this ONE bad item rather than
-                # rejecting the whole request - Adyen batches multiple
-                # notifications into one HTTP call, so one bad signature
-                # (or one item that's actually meant for a different
-                # merchant account) shouldn't stop us from processing the
-                # rest.
                 logger.warning(
-                    "Adyen webhook: signature verification failed for one notification item "
-                    "on provider %s.",
-                    provider_id,
+                    "Adyen webhook: signature verification failed for a "
+                    "notification item referencing transaction %s.",
+                    tx.reference,
                 )
                 continue
 
