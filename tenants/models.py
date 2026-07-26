@@ -32,6 +32,14 @@ class Tenant(models.Model):
     # want that here since this is a creation timestamp.)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        # Without this, Django would name the table
+        # "tenants_tenant" (<app_label>_<lowercased model name>, no
+        # separators between words). We override it with `db_table` to get
+        # a clean snake_case name matching our original schema design (and
+        # Odoo's own payment.* table naming convention).
+        db_table = "tenant"
+
     def __str__(self):
         return self.name
 
@@ -57,6 +65,11 @@ class Customer(models.Model):
         # with reference "42" without colliding - the uniqueness is scoped
         # per-tenant, not global.
         unique_together = ("tenant", "reference")
+        # Without this, Django would name the table "tenants_customer"
+        # (<app_label>_<lowercased model name>). We override it with
+        # `db_table` to get a clean snake_case name matching our original
+        # schema design (and Odoo's own payment.* table naming convention).
+        db_table = "customer"
 
     def __str__(self):
         return f"{self.reference} ({self.tenant_id})"

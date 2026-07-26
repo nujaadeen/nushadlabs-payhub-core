@@ -139,6 +139,13 @@ class PaymentProvider(models.Model):
 
     class Meta:
         unique_together = ("tenant", "code")
+        # Without this, Django would name the table
+        # "payments_core_paymentprovider" (<app_label>_<lowercased model
+        # name>, no separators between words). We override it with
+        # `db_table` to get a clean snake_case name matching our original
+        # schema design (and Odoo's own payment.provider table naming
+        # convention).
+        db_table = "payment_provider"
 
     def __str__(self):
         return f"{self.name} ({self.code}) - {self.tenant_id}"
@@ -223,6 +230,13 @@ class PaymentToken(models.Model):
     active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        # Without this, Django would name the table
+        # "payments_core_paymenttoken". We override it with `db_table` to
+        # get a clean snake_case name matching our original schema design
+        # (and Odoo's own payment.token table naming convention).
+        db_table = "payment_token"
 
     def __str__(self):
         return self.payment_details or str(self.id)
@@ -315,6 +329,12 @@ class PaymentTransaction(models.Model):
 
     class Meta:
         unique_together = ("tenant", "reference")
+        # Without this, Django would name the table
+        # "payments_core_paymenttransaction". We override it with
+        # `db_table` to get a clean snake_case name matching our original
+        # schema design (and Odoo's own payment.transaction table naming
+        # convention).
+        db_table = "payment_transaction"
 
     def __str__(self):
         return f"{self.reference} [{self.state}]"

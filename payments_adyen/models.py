@@ -22,6 +22,14 @@ class PaymentProviderAdyenConfig(models.Model):
     adyen_client_key = models.CharField(max_length=255)  # stored raw for now, encrypt later
     adyen_hmac_key = models.CharField(max_length=255)  # stored raw for now, encrypt later
 
+    class Meta:
+        # Without this, Django would name the table
+        # "payments_adyen_paymentprovideradyenconfig" (the word "adyen"
+        # appearing twice, "provider"+"adyen"+"config" all run together).
+        # We override it with `db_table` to get a clean snake_case name
+        # matching our original schema design.
+        db_table = "payment_provider_adyen_config"
+
     def __str__(self):
         return f"Adyen config for {self.provider_id}"
 
@@ -41,6 +49,13 @@ class PaymentTokenAdyen(models.Model):
     recurring_detail_reference = models.CharField(max_length=255, null=True, blank=True)
     # Adyen's identifier for the shopper this token belongs to on their side.
     adyen_shopper_reference = models.CharField(max_length=255, null=True, blank=True)
+
+    class Meta:
+        # Without this, Django would name the table
+        # "payments_adyen_paymenttokenadyen". We override it with
+        # `db_table` to get a clean snake_case name matching our original
+        # schema design.
+        db_table = "payment_token_adyen"
 
     def __str__(self):
         return f"Adyen details for token {self.token_id}"

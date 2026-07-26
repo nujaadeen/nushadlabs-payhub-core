@@ -23,6 +23,14 @@ class PaymentProviderStripeConfig(models.Model):
     stripe_secret_key = models.CharField(max_length=255)  # stored raw for now, encrypt later
     stripe_webhook_secret = models.CharField(max_length=255)  # stored raw for now, encrypt later
 
+    class Meta:
+        # Without this, Django would name the table
+        # "payments_stripe_paymentproviderstripeconfig" (the word "stripe"
+        # appearing twice, "provider"+"stripe"+"config" all run together).
+        # We override it with `db_table` to get a clean snake_case name
+        # matching our original schema design.
+        db_table = "payment_provider_stripe_config"
+
     def __str__(self):
         return f"Stripe config for {self.provider_id}"
 
@@ -43,6 +51,13 @@ class PaymentTokenStripe(models.Model):
     # Stripe's identifier for the mandate authorizing future off-session
     # charges against this payment method (e.g. required for SEPA).
     stripe_mandate = models.CharField(max_length=255, null=True, blank=True)
+
+    class Meta:
+        # Without this, Django would name the table
+        # "payments_stripe_paymenttokenstripe". We override it with
+        # `db_table` to get a clean snake_case name matching our original
+        # schema design.
+        db_table = "payment_token_stripe"
 
     def __str__(self):
         return f"Stripe details for token {self.token_id}"
