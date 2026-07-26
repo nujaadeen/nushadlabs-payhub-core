@@ -107,9 +107,10 @@ database up directly through `psql` rather than `dropdb`/`createdb`).
   (creates real Stripe Checkout Sessions, verifies webhook signatures,
   applies status updates)
 - `payments_adyen/` - Adyen adapter config/token models,
-  `services.get_feature_support_fields()`, `services.AdyenAdapter` (calls
-  Adyen's `/payments` and `/payments/details` endpoints directly, verifies
-  per-notification-item HMAC signatures, applies status updates)
+  `services.get_feature_support_fields()`, `services.AdyenAdapter` (creates
+  Adyen Sessions API payments in Hosted Checkout mode - see "Adyen: Sessions
+  API + Hosted Checkout" below - and verifies per-notification-item HMAC
+  signatures, applies status updates)
 
 ## Setup
 
@@ -237,10 +238,16 @@ curl -X POST http://localhost:8000/providers/ \
       "merchant_account": "MA123",
       "api_key": "ak_123",
       "client_key": "ck_123",
-      "hmac_key": "hk_123"
+      "hmac_key": "hk_123",
+      "theme_id": "your-adyen-theme-id"
     }
   }'
 ```
+
+`theme_id` is optional at this step (a provider can exist without one), but
+`POST /payments/` will fail with a clear error for this provider until it's
+set - see "Adyen: Sessions API + Hosted Checkout" below for what it is and
+where to get one.
 
 `code` must be `"stripe"` or `"adyen"`; the matching `*_config` object is
 required; registering the same `code` twice for the same tenant returns a
@@ -364,20 +371,82 @@ error message) - see below.
 5. This project always calls Adyen's TEST endpoint
    (`checkout-test.adyen.com`), hardcoded in `payments_adyen/services.py` -
    never a production URL.
-6. **Known limitation:** this phase's `/payments` request doesn't send a
-   `paymentMethod` (real card/iDEAL/etc. details) - Adyen's real sandbox
-   API normally needs one to decide whether a payment completes
-   immediately or needs a redirect, so a real request with valid
-   credentials but no `paymentMethod` will likely get rejected by Adyen
-   with a "required field missing" style error (which surfaces cleanly as
-   `state="error"`, same as any other adapter failure - the failure path
-   itself works correctly). Building a real `paymentMethod` payload is part
-   of the "online_direct" flow, which is out of scope until a later phase.
-   Both response shapes (immediate and redirect) are fully implemented in
-   `AdyenAdapter.get_specific_processing_values` - they were verified by
-   mocking `send_provider_api_request`'s return value in a Django shell
-   session rather than against a real card, precisely because of this
-   limitation.
+6. `theme_id`: see "Adyen: Sessions API + Hosted Checkout" right below -
+   you'll need to create one in the Adyen Customer Area before a real
+   payment against this provider will succeed.
+
+### Adyen: Sessions API + Hosted Checkout
+
+An earlier phase called Adyen's raw `/payments` endpoint directly, mirroring
+Odoo's `payment_adyen` module. That turned out to be the wrong endpoint for
+this project and has been replaced - here's why, and what changed.
+
+**Why `/payments` didn't work for us:** `/payments` requires a
+`paymentMethod` object describing exactly how the shopper wants to pay
+(card details, iDEAL bank, etc.) - real requests without one are rejected
+with `"Required object 'paymentMethod' is not provided"`. Odoo's own
+`payment_adyen` module only avoids this because Odoo ships a frontend
+(Adyen's Drop-in/Components JS) that collects those details in the
+browser, before the server ever calls `/payments`. This project is
+backend-only and redirect-first by design - there's no frontend collecting
+payment method details, and no request-body change fixes this, because
+`/payments` architecturally assumes a frontend that we deliberately don't
+have.
+
+**The fix - Adyen's Sessions API, in `"hosted"` mode:**
+`AdyenAdapter.get_specific_processing_values` (`payments_adyen/services.py`)
+now calls `POST /sessions` on Adyen's Checkout API with `"mode": "hosted"`.
+This is Adyen's equivalent of Stripe Checkout Sessions above: Adyen hosts
+the entire payment page itself, and the `/sessions` response includes a
+ready-made `url` to redirect the shopper to - we never collect or see any
+payment method details ourselves, matching how the Stripe adapter already
+works. This is a deliberate difference from Odoo's `payment_adyen` module,
+not a partial/incomplete port of it - Odoo doesn't support Hosted Checkout
+mode at all (it assumes Drop-in), so there's nothing to mirror there.
+
+Hosted Checkout has two real prerequisites, confirmed against Adyen's
+current integration docs while building this (not guessed):
+
+- **API v72 or later** for the `/sessions` call specifically (the
+  `"mode": "hosted"` request field and the `url` response field aren't
+  available on v71, which is why `payments_adyen/services.py` pins two
+  different Adyen API versions for two different endpoints - see the
+  comments on `ADYEN_API_VERSION` and `ADYEN_SESSIONS_API_VERSION` there).
+- **A `theme_id`** - Adyen requires a "theme" (page branding/layout) to
+  exist before Hosted Checkout will work. There's no API to create one;
+  it's a one-time manual step per Adyen merchant account: in the Adyen
+  Customer Area, go to **Pay by Link -> Themes**, create a theme, and copy
+  its id into `adyen_config.theme_id` (see "Create a provider" above).
+  `PaymentProviderAdyenConfig.adyen_theme_id` is nullable - a provider can
+  exist without one - but `POST /payments/` for that provider will fail
+  immediately with a clear `state="error"` message telling you exactly
+  this, rather than the confusing old `paymentMethod` error.
+
+One behavioral consequence: because Hosted Checkout always redirects the
+shopper to Adyen's own page, Adyen payments in this project now always
+follow the "redirect required" outcome below - the old "processed
+immediately, no redirect" outcome was only ever reachable via raw
+`/payments`, and no longer happens for Adyen.
+
+`search_by_reference`/`apply_updates` in `AdyenAdapter` needed no changes
+for this - Adyen's async webhook notification shape
+(`notificationItems`/`eventCode`/`merchantReference`/`pspReference`) is the
+same regardless of which API created the payment, and both methods were
+already written against that payload shape rather than against a specific
+call site.
+
+**Known follow-up (not yet fixed):** `AdyenPaymentsDetailsView`/
+`AdyenReturnView`/`_complete_adyen_payments_details` (`payments_core/views.py`)
+still implement the old Drop-in-style continuation (`POST
+/payments/details` with a `details` body) for the return trip after a
+redirect. Hosted Checkout's actual continuation is different - Adyen
+redirects the shopper back to `return_url` with `sessionId`/`sessionResult`
+appended, and the correct next call is `GET /sessions/{id}?sessionResult=...`,
+not `POST /payments/details`. In practice this doesn't block payments from
+resolving correctly end-to-end, since Adyen's webhook (`AdyenWebhookView`)
+independently reports the same `AUTHORISATION` result and drives the
+transaction to its final state regardless - but the return-URL continuation
+path itself is a known mismatch worth fixing in a later phase.
 
 ## API reference (Phase 2 additions)
 
@@ -388,9 +457,10 @@ the provider's real API, then updates the transaction based on what came
 back. There are two possible outcomes, and the response shape tells you
 which one happened:
 
-**1. Redirect required** (always for Stripe; Adyen when the payment method
-needs 3D Secure or a similar extra step) - the transaction moves to
-`state="pending"` and the response includes a `redirect_url`:
+**1. Redirect required** (always, for both Stripe and Adyen - see "Adyen:
+Sessions API + Hosted Checkout" above for why Adyen always redirects too,
+now) - the transaction moves to `state="pending"` and the response includes
+a `redirect_url`:
 
 ```json
 {
@@ -409,12 +479,15 @@ webhook calling us, or the customer's browser returning to your own
 "Webhook setup" and "Full end-to-end walkthrough" below. Poll
 `GET /payments/{id}/` to see the result either way.
 
-**2. Processed immediately** (Adyen only, for payment methods that don't
-need a redirect - Adyen's `/payments` response can include a final
-`resultCode` right away). No redirect exists, so `redirect_url` is `null`,
-and the transaction has ALREADY been moved to its real final state
-(`"done"` or `"error"`) by the time you get the response - there's nothing
-further to redirect the customer to or wait on:
+**2. Processed immediately** (historical - not currently reachable by
+either adapter). This outcome existed when Adyen's raw `/payments` endpoint
+could return a final `resultCode` right away for some payment methods; now
+that Adyen uses Sessions/Hosted Checkout (see above), Adyen always
+redirects too, the same as Stripe. The response shape and the
+`_apply_updates`-then-report code path in `PaymentCreateView` (`payments_core/views.py`)
+are left in place rather than deleted, since nothing about them is wrong -
+an adapter CAN still report `redirect_url: null` this way if a future
+adapter or flow ever produces an immediate result again:
 
 ```json
 {
@@ -429,18 +502,18 @@ Either way: `provider_id` must belong to `tenant_id`; the provider must not
 be `state="disabled"`; `amount` must be within the provider's
 `minimum_amount`/`maximum_amount` if either is set. If the call to
 Stripe/Adyen itself fails (bad credentials, network error, an Adyen
-response with neither a redirect action nor a resultCode, ...), the
-response is `502` and the transaction is left in `state="error"` with the
-provider's error message in `state_message` - it is NOT deleted, so you can
-still `GET` it afterward to see what went wrong.
+`/sessions` response missing `url`, ...), the response is `502` and the
+transaction is left in `state="error"` with the provider's error message in
+`state_message` - it is NOT deleted, so you can still `GET` it afterward to
+see what went wrong. For an Adyen provider with no `theme_id` configured
+yet (see "Adyen: Sessions API + Hosted Checkout" above), this fails the
+same way, with a message telling you exactly that.
 
 ### Check a payment's status
 
-`GET /payments/{id}/` - the polling endpoint. For a redirect-based payment,
-poll this after redirecting the customer and after the webhook/return-URL
-flow (see below) has had a chance to run. For an Adyen payment that
-completed immediately, this will already show the transaction's final
-`"done"`/`"error"` state right after `POST /payments/` returns.
+`GET /payments/{id}/` - the polling endpoint. Poll this after redirecting
+the customer and after the webhook/return-URL flow (see below) has had a
+chance to run.
 
 ```bash
 curl http://localhost:8000/payments/<transaction-uuid>/
@@ -630,9 +703,11 @@ curl http://localhost:8000/payments/<TRANSACTION_ID>/
 # {"...", "state": "done", ...}
 ```
 
-The same flow works for Adyen, substituting `code: "adyen"` /
-`adyen_config` in step 3 and the Adyen webhook setup in step 5 - though see
-the "known limitation" note above about Adyen needing real `paymentMethod`
-details this project doesn't send yet, which makes a fully real end-to-end
-Adyen run harder to trigger than Stripe's without building the
-"online_direct" flow first.
+The same flow works for Adyen, substituting `code: "adyen"` / `adyen_config`
+(including a real `theme_id` - see "Adyen: Sessions API + Hosted Checkout"
+above) in step 3 and the Adyen webhook setup in step 5. As of that fix,
+Adyen's redirect-based flow works the same way Stripe's does above - open
+`redirect_url` in a browser, complete the payment on Adyen's hosted page,
+and the webhook (or return-URL call - see the "known follow-up" note above
+about that path's current continuation-endpoint mismatch) drives the
+transaction to `"done"`.

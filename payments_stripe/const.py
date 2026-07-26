@@ -24,3 +24,30 @@ SUPPORTED_CURRENCIES = [
     "SGD",
     "INR",
 ]
+
+# Stripe event `type` values where event["data"]["object"] is genuinely a
+# Checkout Session (i.e. it actually has fields like client_reference_id,
+# status, payment_status - see StripeAdapter.apply_updates/
+# extract_amount_data in services.py, and StripeWebhookView in
+# payments_core/views.py).
+#
+# Unlike Adyen (whose webhooks always carry the same notification item
+# shape regardless of event), Stripe's data.object is a DIFFERENT kind of
+# object depending on the event's `type` - a charge.succeeded event's
+# object is a Charge, a payment_intent.succeeded event's object is a
+# PaymentIntent, and NEITHER of those has a client_reference_id at all
+# (that field only exists on a Checkout Session). Before this list existed,
+# the webhook view read client_reference_id off every event's object
+# regardless of type, which silently failed reference lookup for every
+# non-Checkout-Session event.
+#
+# Mirrors Odoo's own payment_stripe module's HANDLED_WEBHOOK_EVENTS
+# allowlist: only the event types listed here get a reference extracted
+# and passed to PaymentTransaction._process() at all - anything else is
+# acknowledged (logged + a normal 200) without attempting a lookup that
+# would just fail.
+HANDLED_WEBHOOK_EVENTS = [
+    "checkout.session.completed",
+    "checkout.session.async_payment_succeeded",
+    "checkout.session.async_payment_failed",
+]

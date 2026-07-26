@@ -23,9 +23,29 @@ logger = logging.getLogger(__name__)
 # newer versions independently over time; we hardcode a single version here
 # to keep this simple, since this project only calls a couple of Adyen
 # endpoints, all on the same version.
+#
+# NOTE: this project no longer calls plain /payments (see
+# get_specific_processing_values below for why) - only /payments/details
+# (the 3DS-continuation endpoint used by AdyenPaymentsDetailsView/
+# AdyenReturnView in payments_core/views.py) still uses this version.
 ADYEN_API_VERSION = "v71"
-ADYEN_TEST_PAYMENTS_URL = f"https://checkout-test.adyen.com/{ADYEN_API_VERSION}/payments"
 ADYEN_TEST_PAYMENTS_DETAILS_URL = f"https://checkout-test.adyen.com/{ADYEN_API_VERSION}/payments/details"
+
+# The Sessions endpoint used by get_specific_processing_values below - see
+# that method's docstring for why this project uses Sessions (specifically
+# Hosted Checkout mode) instead of the raw /payments endpoint above.
+# Pinned to a NEWER version than ADYEN_API_VERSION deliberately: Adyen's
+# Hosted Checkout mode (the "mode": "hosted" field in the request, and the
+# "url" field this method reads from the response) requires API v72 or
+# later per Adyen's own Hosted Checkout integration docs, checked directly
+# against Adyen's current documentation while building this - v71 (pinned
+# above, still correct for the untouched /payments/details endpoint) does
+# not support it. Two different pinned versions in one file looks odd at
+# first glance, but each is pinned to what its own endpoint actually
+# requires, exactly like ADYEN_API_VERSION's own comment describes for why
+# versions are pinned at all.
+ADYEN_SESSIONS_API_VERSION = "v72"
+ADYEN_SESSIONS_URL = f"https://checkout-test.adyen.com/{ADYEN_SESSIONS_API_VERSION}/sessions"
 
 # The Adyen resultCodes this project currently knows how to react to, and
 # which PaymentTransaction state-transition method each one maps to. This
@@ -192,37 +212,56 @@ class AdyenAdapter(PaymentProviderAdapter):
 
     def get_specific_processing_values(self, transaction):
         """
-        Mirrors Odoo's payment_adyen module's `_send_payment_request` /
-        the underlying `_adyen_make_request` call to Adyen's /payments
-        endpoint, simplified to the "online_redirect" flow only.
+        Uses Adyen's Sessions API (Hosted Checkout mode), NOT Odoo's
+        payment_adyen approach of calling /payments directly - a deliberate,
+        documented exception to "follow Odoo exactly", not a workaround.
 
-        Unlike Stripe (which has a dedicated Checkout Session product for
-        the hosted-redirect case), Adyen's /payments endpoint is the SAME
-        endpoint used for embedded card payments too - it just responds
-        differently depending on what payment method info you send it. A
-        real "online_direct" (embedded card fields) integration would send
-        actual card details in `paymentMethod` and get a result back
-        directly, no redirect. We haven't built that flow (out of scope
-        this phase - see payments_adyen app docs), so calling this against
-        a real Adyen sandbox key without proper paymentMethod details will
-        likely get an error response from Adyen - and that's fine: it comes
-        back to us as a PaymentProviderRequestError, same as any other
-        failure.
+        WHY we deviate from Odoo here: Odoo's payment_adyen module calls
+        Adyen's raw /payments endpoint because Odoo ships a frontend
+        (Adyen's own Drop-in/Components JS) that collects the shopper's
+        chosen payment method details BEFORE that call happens - /payments
+        requires a `paymentMethod` object describing exactly that, and
+        without one it fails with "Required object 'paymentMethod' is not
+        provided". This project is a backend-only, redirect-first API with
+        no frontend of our own to collect that - there's no request-body
+        fix that makes /payments work for us, because we structurally can't
+        satisfy what it actually requires.
 
-        Adyen's /payments response can come back in three different shapes,
-        and this method has to distinguish between them (Odoo's actual
-        payment_adyen module handles the same three cases):
+        Instead we use Adyen's Sessions API with `"mode": "hosted"` - this
+        is Adyen's equivalent of Stripe Checkout Sessions above: Adyen
+        hosts the ENTIRE payment page itself (shopper picks a card, enters
+        details, etc. all on Adyen's own page) and hands back a ready-made
+        redirect URL in the response, so - like Stripe - we never need to
+        collect or even see any payment method details ourselves. Confirmed
+        directly against Adyen's current Hosted Checkout integration docs
+        while building this (not guessed): the /sessions response for
+        "mode": "hosted" includes a `url` field that IS the finished
+        redirect URL - no further construction needed on our end.
 
-          1. Direct/immediate response - a final `resultCode` (e.g.
-             "Authorised", "Refused") right away, no further action needed.
-          2. Additional action required (redirect) - an `action` object
-             with a `url` for 3DS/redirect flows.
-          3. Asynchronous webhook - Adyen calls back later with
-             `notificationItems`. This never comes through THIS response at
-             all (it's a separate HTTP request Adyen makes to US, later),
-             so it's not something this method can see - that's Phase 3.
+        Two real prerequisites this mode has, beyond a normal Sessions call
+        (also confirmed against Adyen's current docs, not guessed):
+          - API v72 or later - see ADYEN_SESSIONS_API_VERSION's comment
+            above for why this differs from ADYEN_API_VERSION.
+          - A `themeId` - see PaymentProviderAdyenConfig.adyen_theme_id in
+            payments_adyen/models.py for what this is and why it can't be
+            auto-provisioned by this method.
+
+        This method no longer needs to distinguish between multiple
+        /payments response shapes (the old three-case immediate-result /
+        action / webhook-only handling this replaced) - Hosted Checkout
+        always responds with a redirect URL; there's no "immediate result,
+        no redirect needed" case here the way raw /payments had, since the
+        shopper always finishes the payment on Adyen's own hosted page.
         """
         config = transaction.provider.adyen_config
+        if not config.adyen_theme_id:
+            raise PaymentProviderRequestError(
+                "This Adyen provider has no adyen_theme_id configured - "
+                "Hosted Checkout requires a theme created in the Adyen "
+                "Customer Area (Pay by Link > Themes) first. See "
+                "PaymentProviderAdyenConfig.adyen_theme_id."
+            )
+
         amount_minor_units = to_minor_currency_units(transaction.amount, transaction.currency)
 
         payload = {
@@ -233,11 +272,18 @@ class AdyenAdapter(PaymentProviderAdapter):
             },
             "reference": transaction.reference,
             "returnUrl": f"{transaction.return_url}?reference={transaction.reference}",
+            "mode": "hosted",
+            "themeId": config.adyen_theme_id,
+            # countryCode is optional (per Adyen's docs) and would normally
+            # improve the shopper's hosted-page experience (localized
+            # payment methods etc.) - omitted entirely here because nothing
+            # in this project currently captures a country for a tenant,
+            # customer, or transaction to source it from.
         }
 
         data = send_provider_api_request(
             "POST",
-            ADYEN_TEST_PAYMENTS_URL,
+            ADYEN_SESSIONS_URL,
             headers={
                 "X-API-Key": config.adyen_api_key,
                 "Content-Type": "application/json",
@@ -245,54 +291,30 @@ class AdyenAdapter(PaymentProviderAdapter):
             json=payload,
         )
 
-        # Case 2 - additional action required: check this FIRST, since a
-        # response can technically carry both an `action` and a
-        # `resultCode` (e.g. resultCode="RedirectShopperRequired") -
-        # a redirect always means "the shopper still has more to do", so it
-        # takes priority over resultCode.
-        action = data.get("action") or {}
-        redirect_url = action.get("url") if action.get("type") == "redirect" else None
-        if redirect_url:
-            return {
-                "redirect_url": redirect_url,
-                "provider_reference": data.get("pspReference"),
-                # `data` is already a plain dict (response.json() parses the
-                # JSON body straight into Python dicts/lists/primitives),
-                # so - unlike Stripe's old SDK object - there's no
-                # conversion needed before storing it in
-                # PaymentTransaction.provider_data.
-                "raw_response": data,
-            }
+        redirect_url = data.get("url")
+        if not redirect_url:
+            # Hosted Checkout is documented to always return `url` - not
+            # having one is a genuinely unexpected response shape, the same
+            # way the old code treated "neither action nor resultCode" as
+            # an error rather than guessing at a fallback.
+            raise PaymentProviderRequestError(
+                "Adyen /sessions response (mode=hosted) did not include a "
+                "'url' to redirect the shopper to - unexpected response "
+                "shape."
+            )
 
-        # Case 1 - direct/immediate response: Adyen has already reached a
-        # final result, with nothing further needed from the shopper.
-        # Odoo's controller calls tx_sudo._process("adyen",
-        # dict(response_content, merchantReference=reference)) immediately
-        # after this same /payments call, rather than waiting for a webhook
-        # to report the same result later - the Phase 3 webhook will
-        # eventually notify us of this too, but there's no reason to make
-        # the API caller wait for it when Adyen already told us
-        # synchronously. This is exactly why _apply_updates() is written to
-        # be safely callable from more than one entry point (here, and
-        # later from the Phase 3 webhook handler) - "processing" a
-        # transaction isn't tied to any one trigger.
-        if data.get("resultCode"):
-            transaction._apply_updates(data)
-            return {
-                "redirect_url": None,
-                "provider_reference": data.get("pspReference"),
-                "status": "processed_immediately",
-                "raw_response": data,
-            }
-
-        # Neither an `action` nor a `resultCode` - not one of the two
-        # response shapes we can get from THIS call (case 3, the webhook,
-        # is a separate request entirely - see the docstring above). This
-        # is a genuinely unexpected response shape, so it's an error.
-        raise PaymentProviderRequestError(
-            "Adyen response contained neither an 'action' nor a 'resultCode' "
-            "- unexpected response shape."
-        )
+        return {
+            "redirect_url": redirect_url,
+            # The session id, not a pspReference - Sessions doesn't hand us
+            # a pspReference until the shopper actually pays (it'll arrive
+            # later via the webhook's AUTHORISATION notification, same as
+            # Stripe's flow only having a Checkout Session id up front, not
+            # a PaymentIntent id). Matches the pattern
+            # StripeAdapter.get_specific_processing_values uses for storing
+            # its own Checkout Session id as provider_reference.
+            "provider_reference": data.get("id"),
+            "raw_response": data,
+        }
 
     def send_payment_request(self, transaction):
         """
@@ -401,12 +423,18 @@ class AdyenAdapter(PaymentProviderAdapter):
         near the top of this file - a deliberately small subset of Odoo's
         full const.RESULT_CODES_MAPPING, just enough to cover the cases
         this project actually produces a resultCode for: the synchronous
-        /payments and /payments/details responses (which send resultCode
-        directly), and this project's webhook handler (which remaps
-        eventCode+success into a resultCode via adyen_event_to_result_code
-        before calling this - see AdyenWebhookView in
-        payments_core/views.py). This method doesn't care WHERE
-        `payment_data` came from, only what's in it.
+        /payments/details response (which sends resultCode directly - see
+        AdyenPaymentsDetailsView/AdyenReturnView in payments_core/views.py),
+        and this project's webhook handler (which remaps eventCode+success
+        into a resultCode via adyen_event_to_result_code before calling
+        this - see AdyenWebhookView in payments_core/views.py). This method
+        doesn't care WHERE `payment_data` came from, only what's in it -
+        which is exactly why switching get_specific_processing_values above
+        to the Sessions API (no more synchronous resultCode from creation
+        itself, only from the webhook or /payments/details afterward)
+        needed no changes here at all: it was already payload-shape-driven,
+        not call-site-driven, verified by rereading it against Adyen's
+        current webhook notification format while making that change.
         """
         # Mirrors Odoo updating provider_reference from the payment data -
         # keeps our record of "what Adyen calls this transaction" current.

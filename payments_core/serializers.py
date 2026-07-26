@@ -23,6 +23,7 @@ ADYEN_CONFIG_FIELD_MAP = {
     "api_key": "adyen_api_key",
     "client_key": "adyen_client_key",
     "hmac_key": "adyen_hmac_key",
+    "theme_id": "adyen_theme_id",
 }
 
 
@@ -49,6 +50,14 @@ class AdyenConfigInputSerializer(serializers.Serializer):
     api_key = serializers.CharField()
     client_key = serializers.CharField()
     hmac_key = serializers.CharField()
+    # Optional (matches adyen_theme_id's null=True/blank=True on
+    # PaymentProviderAdyenConfig - see that field's comment in
+    # payments_adyen/models.py for what this is and why it's not always
+    # available yet at provider-creation time). Payments will fail with a
+    # clear error at POST /payments/ time if this is still missing when a
+    # payment is actually attempted - see AdyenAdapter.
+    # get_specific_processing_values in payments_adyen/services.py.
+    theme_id = serializers.CharField(required=False, allow_blank=True)
 
 
 class PaymentProviderReadSerializer(serializers.ModelSerializer):

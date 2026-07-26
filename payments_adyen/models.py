@@ -21,6 +21,20 @@ class PaymentProviderAdyenConfig(models.Model):
     adyen_api_key = models.CharField(max_length=255)  # stored raw for now, encrypt later
     adyen_client_key = models.CharField(max_length=255)  # stored raw for now, encrypt later
     adyen_hmac_key = models.CharField(max_length=255)  # stored raw for now, encrypt later
+    # Required for the Hosted Checkout flow this project uses (see
+    # AdyenAdapter.get_specific_processing_values in payments_adyen/
+    # services.py for the full explanation of why we use Hosted Checkout at
+    # all). Unlike the other fields above, this ISN'T a secret credential -
+    # it's an id Adyen assigns when a merchant creates a "theme" (page
+    # branding/layout) in their Adyen Customer Area under Pay by Link >
+    # Themes. There is no API to create one; it's a one-time manual setup
+    # step per Adyen merchant account, confirmed against Adyen's current
+    # Hosted Checkout integration docs while building this. null=True/
+    # blank=True because a provider row can exist before this manual step
+    # has been done - get_specific_processing_values raises a clear error
+    # if a payment is actually attempted without it, rather than failing
+    # confusingly inside the Adyen API call.
+    adyen_theme_id = models.CharField(max_length=255, null=True, blank=True)
 
     class Meta:
         # Without this, Django would name the table

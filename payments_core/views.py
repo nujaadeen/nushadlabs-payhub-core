@@ -12,6 +12,7 @@ from payments_adyen.services import (
     AdyenAdapter,
     adyen_event_to_result_code,
 )
+from payments_stripe.const import HANDLED_WEBHOOK_EVENTS as STRIPE_HANDLED_WEBHOOK_EVENTS
 from payments_stripe.services import (
     STRIPE_API_VERSION,
     STRIPE_CHECKOUT_SESSIONS_URL,
@@ -482,8 +483,40 @@ class StripeWebhookView(APIView):
             return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
 
         event = json.loads(raw_body)
-        session = event.get("data", {}).get("object", {})
-        payment_data = {"reference": session.get("client_reference_id"), "checkout_session": session}
+        event_type = event.get("type")
+
+        if event_type not in STRIPE_HANDLED_WEBHOOK_EVENTS:
+            # event["data"]["object"] for this event type is NOT a Checkout
+            # Session (e.g. charge.succeeded/payment_intent.succeeded carry
+            # a Charge/PaymentIntent instead) - see HANDLED_WEBHOOK_EVENTS
+            # in payments_stripe/const.py for the full explanation. Reading
+            # client_reference_id off an object that doesn't have it would
+            # just produce a "no reference" warning below, for no benefit -
+            # so we skip straight to acknowledging receipt instead. This is
+            # a normal, expected outcome for most events Stripe sends us,
+            # not an error: Stripe fans a single checkout out into several
+            # event types, and we only act on the ones we understand.
+            logger.info(
+                "Stripe webhook: received event type '%s' for provider %s - "
+                "not in HANDLED_WEBHOOK_EVENTS, acknowledging without "
+                "processing.",
+                event_type,
+                provider_id,
+            )
+            return Response({"status": "received"})
+
+        # Safe to read client_reference_id directly here: the
+        # HANDLED_WEBHOOK_EVENTS check above guarantees this object is
+        # genuinely a Checkout Session for every event type in this branch,
+        # so "checkout_session" below is an accurate key name, not a
+        # misleading one - contrast with the old code (before this fix),
+        # which used this same key for EVERY event type regardless of
+        # whether the object actually was one.
+        checkout_session = event.get("data", {}).get("object", {})
+        payment_data = {
+            "reference": checkout_session.get("client_reference_id"),
+            "checkout_session": checkout_session,
+        }
 
         try:
             PaymentTransaction._process("stripe", payment_data)

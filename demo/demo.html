@@ -91,6 +91,8 @@
       <input type="text" id="adyenClientKey" value="ck_123">
       <label for="adyenHmacKey">adyen_config.hmac_key</label>
       <input type="text" id="adyenHmacKey" value="hk_123">
+      <label for="adyenThemeId">adyen_config.theme_id (optional - only needed to actually create a payment; see README)</label>
+      <input type="text" id="adyenThemeId" value="">
     </div>
 
     <button type="submit">Create Provider</button>
@@ -332,6 +334,14 @@
         client_key: document.getElementById("adyenClientKey").value,
         hmac_key: document.getElementById("adyenHmacKey").value,
       };
+      // theme_id is optional (see the field's own label above) - only
+      // included if actually filled in, so leaving it blank behaves the
+      // same as not sending the key at all (matches
+      // AdyenConfigInputSerializer's required=False on the API side).
+      const themeId = document.getElementById("adyenThemeId").value;
+      if (themeId) {
+        body.adyen_config.theme_id = themeId;
+      }
     }
 
     const result = await callApi("POST", "/providers/", body);
