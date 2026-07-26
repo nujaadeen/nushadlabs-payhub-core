@@ -230,18 +230,40 @@ class PaymentCreateView(APIView):
 
         # Step 3: a second, separate save recording what the adapter call
         # returned - this only runs once we know the external call actually
-        # succeeded.
+        # succeeded. Note this save() uses update_fields=[...], which limits
+        # the UPDATE to just these three columns - it does NOT touch
+        # state/state_message/last_state_change, so it's safe to run even
+        # if the adapter call below already changed those (see the
+        # no-redirect branch).
         txn.provider_reference = processing_values.get("provider_reference")
         txn.provider_data = processing_values.get("raw_response")
         txn.save(update_fields=["provider_reference", "provider_data", "updated_at"])
-        txn._set_pending()
+
+        redirect_url = processing_values.get("redirect_url")
+        if redirect_url:
+            # The normal redirect-based flow (Stripe always; Adyen when it
+            # needs the shopper to complete a 3DS/redirect step): the
+            # customer still has to go finish the payment on the provider's
+            # page, so this transaction is "pending" until that happens (or
+            # until a Phase 3 webhook tells us otherwise).
+            txn._set_pending()
+        # else: this is Adyen's immediate-processing case (see
+        # AdyenAdapter.get_specific_processing_values in
+        # payments_adyen/services.py) - the adapter has ALREADY called
+        # transaction._apply_updates() and moved this transaction to its
+        # real final state (e.g. "done" or "error") before returning here.
+        # Calling _set_pending() now would be wrong - and would actually
+        # raise ValueError, since "done"/"error" aren't in _set_pending's
+        # allowed source states (see _update_state) - so we skip it
+        # entirely and just report back whatever state the transaction is
+        # already in.
 
         return Response(
             {
                 "id": str(txn.id),
                 "reference": txn.reference,
                 "state": txn.state,
-                "redirect_url": processing_values.get("redirect_url"),
+                "redirect_url": redirect_url,
             },
             status=status.HTTP_201_CREATED,
         )

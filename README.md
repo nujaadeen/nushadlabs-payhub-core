@@ -13,11 +13,16 @@ This is a portfolio/learning project, built in phases.
 - **Phase 2** (this state): payment request creation - a customer can be
   handed a real, working Stripe Checkout Session or Adyen redirect via
   `POST /payments/`, then poll `GET /payments/{id}/` for status. Only the
-  "online_redirect" flow (hosted checkout page) is implemented - no
-  embedded card fields, no charging a saved token, and **no webhook
-  handling yet**, so a transaction will sit in `"pending"` forever after
-  the customer reaches the provider's page - nothing exists yet to move it
-  on to `"done"`. That's expected until Phase 3.
+  "online_redirect" flow is implemented - no embedded card fields, no
+  charging a saved token. **No webhook handling yet** (that's Phase 3), so
+  a transaction that ends up `"pending"` (waiting on the customer to finish
+  on Stripe's/Adyen's page) will sit there forever - nothing exists yet to
+  move it on to `"done"` from a webhook. The one exception: Adyen can
+  sometimes complete a payment immediately, with no redirect and no
+  webhook needed at all - see "Create a payment request" below.
+- Both Stripe and Adyen adapters call their REST APIs directly over plain
+  HTTP (via Python's `requests`) - no Stripe SDK, matching how Odoo's own
+  payment_stripe/payment_adyen modules work.
 
 ## Deliberate gaps
 
@@ -222,29 +227,33 @@ error message) - see below.
 5. This project always calls Adyen's TEST endpoint
    (`checkout-test.adyen.com`), hardcoded in `payments_adyen/services.py` -
    never a production URL.
+6. **Known limitation:** this phase's `/payments` request doesn't send a
+   `paymentMethod` (real card/iDEAL/etc. details) - Adyen's real sandbox
+   API normally needs one to decide whether a payment completes
+   immediately or needs a redirect, so a real request with valid
+   credentials but no `paymentMethod` will likely get rejected by Adyen
+   with a "required field missing" style error (which surfaces cleanly as
+   `state="error"`, same as any other adapter failure - the failure path
+   itself works correctly). Building a real `paymentMethod` payload is part
+   of the "online_direct" flow, which is out of scope until a later phase.
+   Both response shapes (immediate and redirect) are fully implemented in
+   `AdyenAdapter.get_specific_processing_values` - they were verified by
+   mocking `send_provider_api_request`'s return value in a Django shell
+   session rather than against a real card, precisely because of this
+   limitation.
 
 ## API reference (Phase 2 additions)
 
 ### Create a payment request
 
-`POST /payments/` - creates a `PaymentTransaction` in `state="draft"`,
-calls the provider's real API to start a redirect-based payment, then moves
-it to `state="pending"` (or `state="error"` if the provider call fails).
+`POST /payments/` - creates a `PaymentTransaction` in `state="draft"`, calls
+the provider's real API, then updates the transaction based on what came
+back. There are two possible outcomes, and the response shape tells you
+which one happened:
 
-```bash
-curl -X POST http://localhost:8000/payments/ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "<tenant-uuid>",
-    "provider_id": "<provider-uuid>",
-    "customer_id": "<customer-uuid>",
-    "amount": "25.00",
-    "currency": "USD",
-    "return_url": "https://example.com/return"
-  }'
-```
-
-Success response (`201`):
+**1. Redirect required** (always for Stripe; Adyen when the payment method
+needs 3D Secure or a similar extra step) - the transaction moves to
+`state="pending"` and the response includes a `redirect_url`:
 
 ```json
 {
@@ -256,22 +265,43 @@ Success response (`201`):
 ```
 
 Send your end-customer's browser to `redirect_url` to let them complete the
-payment on Stripe's/Adyen's hosted page.
+payment on Stripe's/Adyen's hosted page. Poll `GET /payments/{id}/`
+afterward - though as noted above, nothing moves this past `"pending"` until
+Phase 3's webhook handling exists.
 
-Validation: `provider_id` must belong to `tenant_id`; the provider must not
+**2. Processed immediately** (Adyen only, for payment methods that don't
+need a redirect - Adyen's `/payments` response can include a final
+`resultCode` right away). No redirect exists, so `redirect_url` is `null`,
+and the transaction has ALREADY been moved to its real final state
+(`"done"` or `"error"`) by the time you get the response - there's nothing
+further to redirect the customer to or wait on:
+
+```json
+{
+  "id": "<transaction-uuid>",
+  "reference": "tx-1234567891",
+  "state": "done",
+  "redirect_url": null
+}
+```
+
+Either way: `provider_id` must belong to `tenant_id`; the provider must not
 be `state="disabled"`; `amount` must be within the provider's
 `minimum_amount`/`maximum_amount` if either is set. If the call to
-Stripe/Adyen itself fails (bad credentials, network error, ...), the
+Stripe/Adyen itself fails (bad credentials, network error, an Adyen
+response with neither a redirect action nor a resultCode, ...), the
 response is `502` and the transaction is left in `state="error"` with the
 provider's error message in `state_message` - it is NOT deleted, so you can
 still `GET` it afterward to see what went wrong.
 
 ### Check a payment's status
 
-`GET /payments/{id}/` - the polling endpoint. Poll this after redirecting
-the customer to see whether the payment has moved forward - though as noted
-above, nothing in this phase moves a transaction past `"pending"` yet
-(that's Phase 3, webhooks).
+`GET /payments/{id}/` - the polling endpoint. For a redirect-based payment,
+poll this after redirecting the customer - though nothing in this phase
+moves a `"pending"` transaction any further yet (that's Phase 3, webhooks).
+For an Adyen payment that completed immediately, this will already show the
+transaction's final `"done"`/`"error"` state right after `POST /payments/`
+returns.
 
 ```bash
 curl http://localhost:8000/payments/<transaction-uuid>/

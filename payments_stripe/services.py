@@ -1,8 +1,15 @@
-import stripe
-
-from payments_core.exceptions import PaymentProviderRequestError
 from payments_core.interfaces import PaymentProviderAdapter
-from payments_core.utils import to_minor_currency_units
+from payments_core.utils import send_provider_api_request, to_minor_currency_units
+
+# Stripe versions its whole API by date and expects that date sent as the
+# Stripe-Version header on every request (there's no version number in the
+# URL itself, unlike Adyen). Pinning a specific version here - instead of
+# leaving it unset, which would silently use whatever Stripe's CURRENT
+# default is - means Stripe can't change this endpoint's response shape out
+# from under us later without us noticing (a version bump would be a
+# deliberate, visible change to this one line).
+STRIPE_API_VERSION = "2023-10-16"
+STRIPE_CHECKOUT_SESSIONS_URL = "https://api.stripe.com/v1/checkout/sessions"
 
 
 def get_feature_support_fields(provider):
@@ -54,6 +61,13 @@ class StripeAdapter(PaymentProviderAdapter):
         Stripe Checkout Sessions - Stripe's "hosted redirect" product,
         which is all we're implementing this phase (no embedded card
         fields, no charging a saved token).
+
+        This calls Stripe's REST API directly over plain HTTP, via
+        send_provider_api_request() (payments_core/utils.py) - NOT the
+        `stripe` Python SDK. That matches Odoo's own payment_stripe module,
+        which never uses Stripe's SDK either; every Stripe call in Odoo
+        goes through one generic `_send_api_request` helper, which is what
+        send_provider_api_request() mirrors here.
         """
         # `transaction.provider.stripe_config` reaches across the
         # OneToOneField from payments_stripe/models.py
@@ -62,58 +76,50 @@ class StripeAdapter(PaymentProviderAdapter):
         # provider row.
         config = transaction.provider.stripe_config
 
-        # We set stripe.api_key on the `stripe` module itself, right here,
-        # rather than once at import time in settings.py - credentials are
-        # per-tenant, per-provider in this project (every PaymentProvider
-        # row has its own secret key), so the right key has to be set
-        # immediately before we use it, not globally at process startup.
-        stripe.api_key = config.stripe_secret_key
-
         amount_minor_units = to_minor_currency_units(transaction.amount, transaction.currency)
 
-        try:
-            session = stripe.checkout.Session.create(
-                mode="payment",
-                line_items=[
-                    {
-                        "price_data": {
-                            "currency": transaction.currency.lower(),
-                            "unit_amount": amount_minor_units,
-                            "product_data": {"name": f"Payment {transaction.reference}"},
-                        },
-                        "quantity": 1,
-                    }
-                ],
-                # Stripe echoes this value back to us on the Checkout
-                # Session and on webhook events - using our own reference
-                # here (instead of Stripe's session id) is what will let
-                # Phase 3's webhook handler look up the right
-                # PaymentTransaction row via _search_by_reference().
-                client_reference_id=transaction.reference,
-                success_url=f"{transaction.return_url}?reference={transaction.reference}",
-                cancel_url=f"{transaction.return_url}?reference={transaction.reference}&canceled=true",
-            )
-        except stripe.error.StripeError as exc:
-            # The Stripe SDK raises its own exception hierarchy
-            # (stripe.error.StripeError and subclasses) for anything that
-            # goes wrong - bad credentials, network failure, an invalid
-            # request, Stripe being down, etc. We catch that one broad base
-            # class and re-raise it as our own PaymentProviderRequestError,
-            # so the view layer only ever needs to know about ONE exception
-            # type, regardless of whether Stripe or Adyen is the one that
-            # failed.
-            raise PaymentProviderRequestError(str(exc)) from exc
+        # Stripe's API expects `application/x-www-form-urlencoded` bodies,
+        # NOT JSON - this surprises people expecting a modern REST API to
+        # take JSON, but Stripe's API predates that convention and has kept
+        # form encoding for backwards compatibility ever since. Nested
+        # objects/arrays (like `line_items`) are expressed with bracket
+        # notation in the flat key names below (e.g.
+        # "line_items[0][price_data][currency]") rather than as actual
+        # nested Python dicts/lists - `requests` sends a flat dict like this
+        # as a normal form body when passed via `data=` (as opposed to
+        # `json=`, which we use for Adyen instead - see AdyenAdapter).
+        payload = {
+            "mode": "payment",
+            "client_reference_id": transaction.reference,
+            "success_url": f"{transaction.return_url}?reference={transaction.reference}",
+            "cancel_url": f"{transaction.return_url}?reference={transaction.reference}&canceled=true",
+            "line_items[0][quantity]": 1,
+            "line_items[0][price_data][currency]": transaction.currency.lower(),
+            "line_items[0][price_data][unit_amount]": amount_minor_units,
+            "line_items[0][price_data][product_data][name]": f"Payment {transaction.reference}",
+        }
+
+        response_content = send_provider_api_request(
+            "POST",
+            STRIPE_CHECKOUT_SESSIONS_URL,
+            headers={
+                # Stripe authenticates with a plain Bearer token (the
+                # tenant's own secret key), not an API-key-specific header -
+                # this is standard OAuth2-style bearer auth.
+                "Authorization": f"Bearer {config.stripe_secret_key}",
+                "Stripe-Version": STRIPE_API_VERSION,
+            },
+            data=payload,
+        )
 
         return {
-            "redirect_url": session.url,
-            "provider_reference": session.id,
-            # session.to_dict() converts Stripe's response object into a
-            # plain, JSON-serializable dict (the object itself is a
-            # StripeObject, not a plain dict, and can't be stored directly
-            # in a Postgres JSONField) so it can be saved as-is into
-            # PaymentTransaction.provider_data for later inspection/
-            # debugging.
-            "raw_response": session.to_dict(),
+            "redirect_url": response_content["url"],
+            "provider_reference": response_content["id"],
+            # response_content is already a plain, JSON-serializable dict -
+            # send_provider_api_request() returns response.json() directly -
+            # so unlike the old SDK-based version, there's no conversion
+            # step needed before storing it in PaymentTransaction.provider_data.
+            "raw_response": response_content,
         }
 
     def send_payment_request(self, transaction):
@@ -152,7 +158,17 @@ class StripeAdapter(PaymentProviderAdapter):
         raise NotImplementedError("search_by_reference is implemented in Phase 3")
 
     def apply_updates(self, transaction, payment_data):
-        """Mirrors Odoo's _apply_updates(). Implemented in Phase 3."""
+        """
+        Mirrors Odoo's _apply_updates(). Implemented in Phase 3.
+
+        Stripe's flow in this project stays fully redirect-based for now
+        (see get_specific_processing_values above) - unlike Adyen, Stripe's
+        Checkout Session response never contains a final result on its own,
+        so there's no "immediate result" case to handle synchronously here.
+        This won't be exercised until Phase 3 wires up Stripe's webhook
+        handling, which is what actually tells us how the payment went.
+        """
+        # TODO: Phase 3
         raise NotImplementedError("apply_updates is implemented in Phase 3")
 
     def extract_amount_data(self, transaction, payment_data):
