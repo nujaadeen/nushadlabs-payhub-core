@@ -441,7 +441,7 @@ class AdyenAdapter(PaymentProviderAdapter):
         # This assignment alone does NOT hit the database - it's persisted
         # either by the state-transition call below (_set_done/_set_error
         # only saves the state-related fields, not this one) or by the
-        # caller's own save() afterward (see PaymentCreateView and
+        # caller's own save() afterward (see PaymentListCreateView and
         # PaymentTransaction._process in payments_core/models.py, both of
         # which save provider_reference explicitly after calling into the
         # adapter).

@@ -89,3 +89,36 @@ class CustomerSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"reference": "A customer with this reference already exists for this tenant."}
             )
+
+
+class CustomerReadSerializer(serializers.ModelSerializer):
+    """
+    Handles the OUTPUT side of GET /customers/ - deliberately a SEPARATE
+    serializer from CustomerSerializer above (which handles POST
+    /customers/), rather than reusing it, purely to get a field named
+    "tenant_id" instead of "tenant" in the response.
+
+    DRF magic worth calling out (same trick as
+    PaymentProviderReadSerializer.tenant_id in
+    payments_core/serializers.py): Django gives every ForeignKey field an
+    automatic "<field>_id" attribute alongside the "<field>" attribute
+    itself - e.g. `customer.tenant` (the full related Tenant row - costs a
+    database query to load) and `customer.tenant_id` (just the raw UUID
+    already sitting on this row, no extra query needed). Naming this
+    serializer field "tenant_id" makes DRF read straight from that
+    attribute (no `source=` needed - DRF only needs `source=` when the
+    serializer field name DOESN'T match the model attribute name), so list
+    responses include the tenant's id without an extra query per customer.
+    """
+
+    tenant_id = serializers.UUIDField(read_only=True)
+
+    class Meta:
+        model = Customer
+        fields = ["id", "tenant_id", "reference", "created_at"]
+        # "tenant_id" is excluded here because it's already explicitly
+        # declared as read_only=True above - DRF raises an error if a
+        # field is both explicitly declared AND listed in read_only_fields
+        # (same reasoning as PaymentProviderReadSerializer.read_only_fields
+        # in payments_core/serializers.py).
+        read_only_fields = [f for f in fields if f != "tenant_id"]

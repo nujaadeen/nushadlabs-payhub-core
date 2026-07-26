@@ -292,7 +292,7 @@ class PaymentTransactionCreateSerializer(serializers.Serializer):
     Plain DRF `Serializer` (not `ModelSerializer`) on purpose: the actual
     row-creation-then-external-call-then-update flow for this endpoint is
     deliberately spread across several explicit steps in the view (see
-    PaymentCreateView.post() in views.py) rather than being
+    PaymentListCreateView.post() in views.py) rather than being
     collapsed into a single serializer.save() the way our provider
     serializers do it - because, unlike a provider, creating a
     PaymentTransaction here involves an external HTTP call to Stripe/Adyen
@@ -335,3 +335,79 @@ class PaymentTransactionReadSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+
+class PaymentTransactionProviderSerializer(serializers.ModelSerializer):
+    """
+    A tiny nested representation of a transaction's provider, used only by
+    PaymentTransactionListSerializer below - just enough (code + name) to
+    show something human-readable in a transaction-history list without
+    the caller needing a second API call to GET /providers/{id}/ per row.
+    """
+
+    class Meta:
+        model = PaymentProvider
+        fields = ["id", "code", "name"]
+        read_only_fields = fields
+
+
+class PaymentTransactionListSerializer(serializers.ModelSerializer):
+    """
+    Handles the OUTPUT side of GET /payments/ (list) - see
+    PaymentListCreateView.get() in views.py. Deliberately a richer field
+    set than PaymentTransactionReadSerializer above (GET /payments/{id}/,
+    the polling endpoint): this one is meant to back a transaction-history
+    view/table, where seeing WHICH tenant/customer/provider each row
+    belongs to (without a separate lookup per row) is the whole point,
+    whereas the polling endpoint deliberately keeps that internal detail
+    out of the response.
+
+    tenant_id/customer_id/provider_id: same DRF trick as
+    PaymentProviderReadSerializer.tenant_id above - Django gives every
+    ForeignKey field an automatic "<field>_id" attribute alongside the
+    "<field>" attribute itself (e.g. `transaction.provider`, a full
+    PaymentProvider row that costs a query to load, vs
+    `transaction.provider_id`, just the raw id already on this row).
+    Naming these serializer fields "..._id" makes DRF read straight from
+    those cheap attributes instead.
+
+    `provider` (below) is different from those three: it's a NESTED
+    serializer, not a plain id field, so it DOES need the full related
+    PaymentProvider row to render code/name - see
+    PaymentListCreateView.get() for how we avoid one extra database query
+    PER transaction for this via `select_related("provider")`.
+    """
+
+    tenant_id = serializers.UUIDField(read_only=True)
+    customer_id = serializers.UUIDField(read_only=True)
+    provider_id = serializers.UUIDField(read_only=True)
+    provider = PaymentTransactionProviderSerializer(read_only=True)
+
+    class Meta:
+        model = PaymentTransaction
+        fields = [
+            "id",
+            "tenant_id",
+            "customer_id",
+            "provider_id",
+            "provider",
+            "reference",
+            "amount",
+            "currency",
+            "state",
+            "state_message",
+            "provider_reference",
+            "created_at",
+            "updated_at",
+        ]
+        # Every field here is explicitly declared as read-only above,
+        # either directly (the four "_id"/nested fields) or because this
+        # serializer is only ever used to RENDER a list, never to validate
+        # input - "tenant_id"/"customer_id"/"provider_id"/"provider" are
+        # excluded from this list since DRF raises an error if a field is
+        # both explicitly declared AND listed in read_only_fields (same
+        # reasoning as PaymentProviderReadSerializer.read_only_fields
+        # above).
+        read_only_fields = [
+            f for f in fields if f not in ("tenant_id", "customer_id", "provider_id", "provider")
+        ]

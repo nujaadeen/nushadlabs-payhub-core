@@ -172,8 +172,18 @@ curl http://localhost:8000/health/
 
 ## API reference (tenants app)
 
-Creation-only - no auth, matching every other endpoint. There's no
-list/get/update/delete for either of these yet; that's out of scope so far.
+No auth, matching every other endpoint. List and create only - no
+get-one/update/delete for either of these yet; that's out of scope so far.
+
+### List tenants
+
+`GET /tenants/` - returns every tenant. No filtering (there's no "tenant of
+a tenant" concept anywhere in this project - every tenant is top-level) and
+no pagination (small demo/admin tool, not expecting thousands of tenants).
+
+```bash
+curl http://localhost:8000/tenants/
+```
 
 ### Create a tenant
 
@@ -181,6 +191,17 @@ list/get/update/delete for either of these yet; that's out of scope so far.
 curl -X POST http://localhost:8000/tenants/ \
   -H "Content-Type: application/json" \
   -d '{"name": "Acme Inc"}'
+```
+
+### List a tenant's customers
+
+`GET /customers/?tenant_id=<tenant-uuid>` - `tenant_id` is required (mirrors
+`GET /providers/?tenant_id=...` below) - a missing `tenant_id` returns a
+clean 400 rather than silently returning every customer across every
+tenant.
+
+```bash
+curl "http://localhost:8000/customers/?tenant_id=<tenant-uuid>"
 ```
 
 ### Create a customer
@@ -509,11 +530,57 @@ see what went wrong. For an Adyen provider with no `theme_id` configured
 yet (see "Adyen: Sessions API + Hosted Checkout" above), this fails the
 same way, with a message telling you exactly that.
 
+### List transactions
+
+`GET /payments/` - returns transactions, newest first (ordered by
+`created_at` descending - mirrors Odoo's own `payment.transaction._order =
+"id desc"`; we order by `created_at` instead of `id` since our primary key
+is a UUID, which - unlike Odoo's auto-incrementing integer id - has no
+ordering meaning of its own). All three query params below are optional
+and combine as an AND filter; omit all of them to get every transaction
+across every tenant (this is our own admin/debug view with no auth, so
+that's intentional here, unlike `GET /customers/` above which requires
+`tenant_id`). No pagination yet:
+
+```bash
+curl http://localhost:8000/payments/
+curl "http://localhost:8000/payments/?tenant_id=<tenant-uuid>"
+curl "http://localhost:8000/payments/?tenant_id=<tenant-uuid>&customer_id=<customer-uuid>"
+curl "http://localhost:8000/payments/?provider_id=<provider-uuid>"
+```
+
+Each transaction includes a small nested `provider` object (`id`, `code`,
+`name`) alongside the plain `provider_id`, so a transaction-history UI can
+show e.g. "Stripe - Acme Stripe" without a separate `GET /providers/{id}/`
+call per row:
+
+```json
+[
+  {
+    "id": "<transaction-uuid>",
+    "tenant_id": "<tenant-uuid>",
+    "customer_id": "<customer-uuid>",
+    "provider_id": "<provider-uuid>",
+    "provider": {"id": "<provider-uuid>", "code": "stripe", "name": "Acme Stripe"},
+    "reference": "tx-1234567890",
+    "amount": "25.00",
+    "currency": "USD",
+    "state": "done",
+    "state_message": null,
+    "provider_reference": "cs_test_...",
+    "created_at": "...",
+    "updated_at": "..."
+  }
+]
+```
+
 ### Check a payment's status
 
 `GET /payments/{id}/` - the polling endpoint. Poll this after redirecting
 the customer and after the webhook/return-URL flow (see below) has had a
-chance to run.
+chance to run. Deliberately a smaller field list than the list endpoint
+above - just enough for a caller to know what's going on with their one
+payment, not the tenant/customer/provider detail a history view needs.
 
 ```bash
 curl http://localhost:8000/payments/<transaction-uuid>/

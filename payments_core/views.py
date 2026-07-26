@@ -27,6 +27,7 @@ from .serializers import (
     PaymentProviderReadSerializer,
     PaymentProviderUpdateSerializer,
     PaymentTransactionCreateSerializer,
+    PaymentTransactionListSerializer,
     PaymentTransactionReadSerializer,
 )
 from .utils import send_provider_api_request
@@ -197,13 +198,64 @@ class ProviderDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class PaymentCreateView(APIView):
+class PaymentListCreateView(APIView):
     """
-    Handles POST /payments/ - mirrors Odoo's
-    PaymentPortal._create_transaction() -> payment.transaction.create() ->
-    tx._get_processing_values() -> adapter._send_payment_request() flow,
-    simplified to the "online_redirect" operation only.
+    Handles GET /payments/ (list) and POST /payments/ (create) - renamed
+    from PaymentCreateView now that this view handles both, matching the
+    "ListCreateView does both GET and POST" naming/style already used by
+    ProviderListCreateView below. POST's behavior (payment creation) is
+    unchanged from before this rename - see that method's own comments.
     """
+
+    def get(self, request):
+        # All three filters are OPTIONAL, unlike GET /customers/'s
+        # required tenant_id (see CustomerListCreateView in
+        # tenants/views.py) - this is deliberately our own admin/debug
+        # view with no auth, so returning every transaction across every
+        # tenant when no filter is given is intentional here, not an
+        # oversight. Real multi-tenant products would never expose this
+        # unscoped by default; this project has no auth at all yet (see
+        # settings.py), so there's no "logged in as tenant X" concept to
+        # scope to automatically even if we wanted to.
+        transactions = PaymentTransaction.objects.all()
+
+        tenant_id = request.query_params.get("tenant_id")
+        if tenant_id:
+            transactions = transactions.filter(tenant_id=tenant_id)
+
+        customer_id = request.query_params.get("customer_id")
+        if customer_id:
+            transactions = transactions.filter(customer_id=customer_id)
+
+        provider_id = request.query_params.get("provider_id")
+        if provider_id:
+            transactions = transactions.filter(provider_id=provider_id)
+
+        # select_related("provider") - a Django/DRF performance detail
+        # worth understanding: PaymentTransactionListSerializer (see
+        # serializers.py) nests each transaction's provider (code + name)
+        # in the response. Without this, DRF would run one EXTRA query
+        # PER transaction to fetch its provider row while rendering that
+        # nested field ("N+1 queries" - N transactions plus 1 for the
+        # original list). select_related() tells Django to fetch each
+        # transaction's provider via a single SQL JOIN, as part of the
+        # SAME query that fetches the transactions themselves - so this
+        # whole endpoint costs exactly one query no matter how many
+        # transactions or filters are involved.
+        #
+        # Mirrors Odoo's own payment.transaction `_order = "id desc"` -
+        # newest first, since that's what anyone browsing a transaction
+        # history actually wants to see, and a UUID primary key (unlike
+        # Odoo's own auto-incrementing integer id) has no ordering meaning
+        # of its own, so we order by created_at instead.
+        #
+        # TODO: add pagination once transaction volume matters - this
+        # project is a small demo/admin tool for now, not expecting
+        # thousands of rows.
+        transactions = transactions.select_related("provider").order_by("-created_at")
+
+        serializer = PaymentTransactionListSerializer(transactions, many=True)
+        return Response(serializer.data)
 
     def post(self, request):
         serializer = PaymentTransactionCreateSerializer(data=request.data)
