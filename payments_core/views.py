@@ -1,9 +1,22 @@
+import json
+import logging
+
 from django.db import IntegrityError
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from payments_adyen.services import (
+    ADYEN_TEST_PAYMENTS_DETAILS_URL,
+    AdyenAdapter,
+    adyen_event_to_result_code,
+)
+from payments_stripe.services import (
+    STRIPE_API_VERSION,
+    STRIPE_CHECKOUT_SESSIONS_URL,
+    StripeAdapter,
+)
 from tenants.models import Customer
 
 from .exceptions import PaymentProviderRequestError
@@ -15,6 +28,9 @@ from .serializers import (
     PaymentTransactionCreateSerializer,
     PaymentTransactionReadSerializer,
 )
+from .utils import send_provider_api_request
+
+logger = logging.getLogger(__name__)
 
 
 class HealthCheckView(APIView):
@@ -275,13 +291,324 @@ class PaymentDetailView(APIView):
     check a payment's current status (mirrors Odoo's `/payment/status` page
     polling pattern, but as a plain JSON endpoint since we have no UI).
 
-    No webhook handling exists yet (that's Phase 3), so right now a
-    transaction created via POST /payments/ will sit in `state="pending"`
-    forever once the customer reaches the provider's page - there's nothing
-    yet that moves it on to "done"/"authorized"/"error" after that point.
-    That's expected for this phase.
+    As of this phase, a "pending" transaction no longer sits there forever:
+    the webhook views and return-URL views below (StripeWebhookView,
+    StripeReturnView, AdyenWebhookView, AdyenReturnView,
+    AdyenPaymentsDetailsView) all eventually call
+    PaymentTransaction._process(), which is what actually drives a
+    transaction on to "done"/"authorized"/"cancel"/"error". This view
+    itself doesn't do any of that work - it just reads whatever state the
+    transaction is CURRENTLY in.
     """
 
     def get(self, request, pk):
         txn = get_object_or_404(PaymentTransaction, pk=pk)
         return Response(PaymentTransactionReadSerializer(txn).data)
+
+
+class StripeReturnView(APIView):
+    """
+    Handles GET /webhooks/stripe/return/ - mirrors Odoo's `stripe_return`
+    controller.
+
+    Design note: this is NOT the URL Stripe redirects the customer's
+    browser to - that's still `transaction.return_url` (the TENANT's own
+    page, set by whoever called POST /payments/, unchanged from Phase 2).
+    Odoo's `stripe_return` IS the literal browser redirect target, and
+    renders a real webpage there; we're a pure JSON API with nothing to
+    render, so we split that into two separate things: the customer's
+    browser lands on the tenant's OWN page (as configured), and THIS
+    endpoint is what that page is expected to call afterward (e.g. from
+    its own backend, or client-side JS) - passing along the `reference`
+    Stripe appended to that page's URL (see the `?reference=` Phase 2's
+    StripeAdapter adds to success_url/cancel_url) - so we can go check with
+    Stripe directly what actually happened and move the transaction on.
+    """
+
+    def get(self, request):
+        reference = request.query_params.get("reference")
+        if not reference:
+            return Response(
+                {"error": "reference query parameter is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        tx = PaymentTransaction._search_by_reference("stripe", {"reference": reference})
+        if tx is None:
+            return Response(
+                {"error": "No matching transaction found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        config = tx.provider.stripe_config
+        try:
+            session = send_provider_api_request(
+                "GET",
+                f"{STRIPE_CHECKOUT_SESSIONS_URL}/{tx.provider_reference}",
+                headers={
+                    "Authorization": f"Bearer {config.stripe_secret_key}",
+                    "Stripe-Version": STRIPE_API_VERSION,
+                },
+            )
+        except PaymentProviderRequestError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        PaymentTransaction._process(
+            "stripe", {"reference": reference, "checkout_session": session}
+        )
+
+        tx.refresh_from_db()
+        return Response({"reference": tx.reference, "state": tx.state})
+
+
+class StripeWebhookView(APIView):
+    """
+    Handles POST /webhooks/stripe/<uuid:provider_id>/ - mirrors Odoo's
+    Stripe webhook controller.
+
+    # TODO: Phase 5 - guard against duplicate webhook delivery
+    # re-processing the same event (Stripe retries webhooks that don't get
+    # a fast 2xx response, and can also just send the same event twice -
+    # see Stripe's own docs on webhook idempotency).
+
+    Design note on the URL: Odoo uses ONE shared webhook endpoint for every
+    tenant/provider, and figures out which provider a webhook belongs to
+    from the event's OWN content plus its normal auth/admin layer. We have
+    NO auth at all, so there's no other way to know "which tenant's
+    stripe_webhook_secret should I verify this against" - embedding
+    provider_id in the URL is our pragmatic stand-in for what Stripe's own
+    "Connect" webhook routing would otherwise give us. It's what lets us
+    look up the RIGHT provider's secret to verify the signature against,
+    BEFORE we trust anything in the request body.
+
+    Django/DRF gotcha this view works around: DRF's `request.data`
+    AUTO-PARSES the request body into a dict the first time you touch it -
+    convenient normally, but wrong here. Signature verification needs the
+    EXACT raw bytes Stripe hashed to produce the signature; even one
+    different whitespace character between what Stripe sent and what we'd
+    get back from re-serializing a parsed-and-rebuilt dict would make our
+    HMAC computation not match theirs. So this view deliberately reads
+    `request.body` (raw bytes, straight from Django's underlying
+    HttpRequest - DRF doesn't touch or alter this) and does its OWN
+    `json.loads()` on it afterward, and never touches `request.data` at
+    all in this view.
+
+    Also note: we don't need an `@csrf_exempt` decorator here, even though
+    Stripe's servers obviously can't supply a Django CSRF token. DRF's
+    `APIView.as_view()` wraps EVERY view it builds with `csrf_exempt`
+    automatically - Django's CSRF protection exists to stop a malicious
+    WEBSITE from tricking a logged-in user's BROWSER into making a request
+    using their session cookie; DRF re-applies that protection itself only
+    for `SessionAuthentication`, which this project doesn't use anywhere
+    (see REST_FRAMEWORK in settings.py) - so it's simply never in play on
+    any view in this whole project, this one included.
+    """
+
+    def post(self, request, provider_id):
+        provider = get_object_or_404(PaymentProvider, pk=provider_id, code="stripe")
+
+        raw_body = request.body  # bytes - see docstring above for why
+        # Django exposes incoming HTTP headers as request.META keys,
+        # prefixed with "HTTP_" and with dashes turned into underscores -
+        # this is how a WSGI server hands headers to Django under the hood.
+        # DRF's `request.headers` (a friendlier, case-insensitive mapping)
+        # reads the exact same underlying data and would work just as well
+        # here; request.META is what we use simply to keep this close to
+        # how Odoo's own Django-adjacent code reads headers.
+        signature_header = request.META.get("HTTP_STRIPE_SIGNATURE", "")
+
+        adapter = StripeAdapter()
+        try:
+            adapter.verify_webhook_signature(
+                raw_body, signature_header, provider.stripe_config.stripe_webhook_secret
+            )
+        except PaymentProviderRequestError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+
+        event = json.loads(raw_body)
+        session = event.get("data", {}).get("object", {})
+        payment_data = {"reference": session.get("client_reference_id"), "checkout_session": session}
+
+        try:
+            PaymentTransaction._process("stripe", payment_data)
+        except Exception:
+            # Mirrors Odoo's own webhook controllers, which deliberately
+            # catch broad exceptions here (not just our own
+            # PaymentProviderRequestError) and log rather than let them
+            # propagate - ANY non-2xx response makes Stripe retry the same
+            # webhook again later, so a bug on OUR side would otherwise
+            # turn into an endless retry loop instead of just being visible
+            # in our own logs. Signature failures are the one case that
+            # SHOULD be a non-2xx (403, above) - a bad signature isn't
+            # going to fix itself on retry, so there's no point Stripe
+            # trying again.
+            logger.exception(
+                "Error while processing Stripe webhook for provider %s", provider_id
+            )
+
+        return Response({"status": "received"})
+
+
+def _complete_adyen_payments_details(reference, details):
+    """
+    Shared logic for AdyenPaymentsDetailsView and AdyenReturnView below -
+    both end up doing exactly the same thing (look up the transaction, POST
+    to Adyen's /payments/details with whatever `details` payload we have,
+    run the result through _process()), just triggered by different
+    callers - a frontend calling us directly vs. the customer's browser
+    landing back on our return URL after a 3DS challenge. Factored out once
+    here instead of duplicated in both views.
+    """
+    tx = PaymentTransaction._search_by_reference("adyen", {"merchantReference": reference})
+    if tx is None:
+        return Response(
+            {"error": "No matching transaction found."}, status=status.HTTP_404_NOT_FOUND
+        )
+
+    config = tx.provider.adyen_config
+    try:
+        response_content = send_provider_api_request(
+            "POST",
+            ADYEN_TEST_PAYMENTS_DETAILS_URL,
+            headers={"X-API-Key": config.adyen_api_key, "Content-Type": "application/json"},
+            json={"details": details},
+        )
+    except PaymentProviderRequestError as exc:
+        return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    PaymentTransaction._process("adyen", dict(response_content, merchantReference=reference))
+
+    tx.refresh_from_db()
+    return Response({"reference": tx.reference, "state": tx.state})
+
+
+class AdyenPaymentsDetailsView(APIView):
+    """
+    Handles POST /webhooks/adyen/payments-details/ - mirrors Odoo's
+    `adyen_payment_details` controller.
+
+    This is the "continuation" call for Adyen payment methods that need an
+    extra round-trip after the initial /payments call - typically 3D
+    Secure (see AdyenAdapter.get_specific_processing_values in
+    payments_adyen/services.py, which returns a `redirect_url` for exactly
+    this case). A real frontend integration would collect whatever
+    "details" Adyen's own client-side SDK produces after the shopper
+    completes that challenge and POST them here. This project has no
+    frontend to actually DO that collection, so this endpoint exists for
+    completeness/parity with Odoo's architecture rather than being
+    something we've fully exercised end-to-end with a real 3DS challenge
+    ourselves.
+
+    Unlike the webhook views above, this is a plain JSON POST from OUR OWN
+    caller (a frontend we'd build later) - not a request we need to verify
+    a provider's signature on - so DRF's normal automatic `request.data`
+    JSON parsing is completely fine here. There's no raw-body gotcha for
+    this particular view.
+    """
+
+    def post(self, request):
+        reference = request.data.get("reference")
+        details = request.data.get("details")
+        if not reference or details is None:
+            return Response(
+                {"error": "reference and details are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return _complete_adyen_payments_details(reference, details)
+
+
+class AdyenReturnView(APIView):
+    """
+    Handles GET /webhooks/adyen/return/ - mirrors Odoo's
+    `adyen_return_from_3ds_auth` controller. In a real deployment this
+    would be the `returnUrl` Adyen redirects the customer's browser to
+    after a 3DS challenge, appending `merchantReference` and
+    `redirectResult` as query params - same "no frontend of our own"
+    caveat as AdyenPaymentsDetailsView above applies to how this would
+    actually get exercised end-to-end.
+    """
+
+    def get(self, request):
+        reference = request.query_params.get("merchantReference")
+        redirect_result = request.query_params.get("redirectResult")
+        if not reference or not redirect_result:
+            return Response(
+                {"error": "merchantReference and redirectResult are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return _complete_adyen_payments_details(reference, {"redirectResult": redirect_result})
+
+
+class AdyenWebhookView(APIView):
+    """
+    Handles POST /webhooks/adyen/<uuid:provider_id>/ - mirrors Odoo's
+    `adyen_webhook` controller.
+
+    # TODO: Phase 5 - guard against duplicate webhook delivery
+    # re-processing the same event.
+
+    Same design rationale for provider_id being in the URL as
+    StripeWebhookView above - see that view's docstring. We use the
+    provider looked up from the URL (fetched once, up front) to verify
+    EVERY notification item in this request against, rather than looking
+    up each item's own provider via _search_by_reference first - verifying
+    against attacker-controllable data before we've verified anything would
+    be backwards, and since Adyen delivers webhooks to a URL configured
+    PER merchant account, every item arriving at THIS url should belong to
+    THIS provider anyway.
+
+    Unlike Stripe (which signs the whole request body once), Adyen signs
+    EACH item inside `notificationItems` individually - so there's no
+    single raw-body HMAC check for the whole request the way Stripe has.
+    Because of that, this view uses `request.data` normally (DRF's
+    automatic JSON parsing is completely fine here - the signature we need
+    to check lives INSIDE specific fields of the already-parsed body, not
+    in the exact raw bytes of the body itself, so there's no gotcha to work
+    around this time).
+    """
+
+    def post(self, request, provider_id):
+        provider = get_object_or_404(PaymentProvider, pk=provider_id, code="adyen")
+        hmac_key = provider.adyen_config.adyen_hmac_key
+        adapter = AdyenAdapter()
+
+        for item_wrapper in request.data.get("notificationItems", []):
+            item = item_wrapper.get("NotificationRequestItem", {})
+
+            try:
+                adapter.verify_webhook_signature(item, hmac_key)
+            except PaymentProviderRequestError:
+                # Mirrors Odoo: skip just this ONE bad item rather than
+                # rejecting the whole request - Adyen batches multiple
+                # notifications into one HTTP call, so one bad signature
+                # (or one item that's actually meant for a different
+                # merchant account) shouldn't stop us from processing the
+                # rest.
+                logger.warning(
+                    "Adyen webhook: signature verification failed for one notification item "
+                    "on provider %s.",
+                    provider_id,
+                )
+                continue
+
+            result_code = adyen_event_to_result_code(
+                item.get("eventCode"), item.get("success") == "true"
+            )
+            if result_code is None:
+                continue
+
+            payment_data = dict(item, resultCode=result_code)
+
+            try:
+                PaymentTransaction._process("adyen", payment_data)
+            except Exception:
+                # Same reasoning as StripeWebhookView's broad except -
+                # never let a processing bug turn into an endless Adyen
+                # retry loop; log it and move on to the next item.
+                logger.exception("Error while processing an Adyen webhook notification item.")
+
+        # Adyen's own integration docs require this EXACT literal string in
+        # the response body to acknowledge receipt - not a general "ok" or
+        # "success" message. Response("[accepted]") JSON-encodes it as the
+        # string "[accepted]" (with quotes), which is what Adyen expects to
+        # see.
+        return Response("[accepted]")

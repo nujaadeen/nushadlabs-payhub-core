@@ -1,5 +1,28 @@
+import hashlib
+import hmac
+import logging
+import time
+
+from payments_core.exceptions import PaymentProviderRequestError
 from payments_core.interfaces import PaymentProviderAdapter
-from payments_core.utils import send_provider_api_request, to_minor_currency_units
+from payments_core.utils import (
+    send_provider_api_request,
+    to_major_currency_units,
+    to_minor_currency_units,
+)
+
+# Importing payments_core.models at the TOP of this file (rather than
+# lazily inside a function, the way payments_core/models.py has to import
+# US) is safe here and does NOT create a circular import: payments_core's
+# only import of payments_stripe.services is deferred until a method
+# actually RUNS (see _get_adapter_for_provider_code in
+# payments_core/models.py), so nothing forces THIS file to be loaded while
+# payments_core.models is still being defined. payments_stripe/models.py
+# already imports payments_core.models at its own top level too, for the
+# same reason - this isn't a new pattern.
+from payments_core.models import PaymentTransaction
+
+logger = logging.getLogger(__name__)
 
 # Stripe versions its whole API by date and expects that date sent as the
 # Stripe-Version header on every request (there's no version number in the
@@ -10,6 +33,28 @@ from payments_core.utils import send_provider_api_request, to_minor_currency_uni
 # deliberate, visible change to this one line).
 STRIPE_API_VERSION = "2023-10-16"
 STRIPE_CHECKOUT_SESSIONS_URL = "https://api.stripe.com/v1/checkout/sessions"
+
+# How old (in seconds) a webhook's timestamp is allowed to be before we
+# reject it outright. This guards against a "replay attack" - someone
+# capturing a genuine, correctly-signed webhook request and resending it
+# later to trigger the same state change again. 600 seconds (10 minutes)
+# mirrors Odoo's own WEBHOOK_AGE_TOLERANCE.
+STRIPE_WEBHOOK_AGE_TOLERANCE = 600
+
+# Stripe PaymentIntent status -> the PaymentTransaction state-transition
+# method that status should drive. Mirrors Odoo's own status mapping
+# conceptually, trimmed down to a plain dict - Odoo tracks a couple of
+# PaymentIntent statuses we don't need to distinguish here (e.g. it treats
+# 'requires_action' and 'processing' as meaningfully different for some UI
+# purposes; we just treat both as "still pending").
+STRIPE_PAYMENT_INTENT_STATUS_TRANSITIONS = {
+    "succeeded": "_set_done",
+    "requires_capture": "_set_authorized",
+    "processing": "_set_pending",
+    "requires_action": "_set_pending",
+    "requires_payment_method": "_set_error",
+    "canceled": "_set_canceled",
+}
 
 
 def get_feature_support_fields(provider):
@@ -149,31 +194,187 @@ class StripeAdapter(PaymentProviderAdapter):
         """Mirrors Odoo's _send_refund_request(). Implemented in Phase 3."""
         raise NotImplementedError("send_refund_request is implemented in Phase 3")
 
-    def verify_webhook_signature(self, request):
-        """Verifies an incoming webhook actually came from Stripe. Implemented in Phase 3."""
-        raise NotImplementedError("verify_webhook_signature is implemented in Phase 3")
+    def verify_webhook_signature(self, raw_body, signature_header, webhook_secret):
+        """
+        Mirrors Odoo's payment_stripe module's webhook signature check
+        (Stripe's own standard algorithm, documented in Stripe's own
+        webhook docs - Odoo doesn't invent this, just implements it).
+
+        Stripe signs each webhook by HMAC-SHA256-ing the string
+        "{timestamp}.{raw request body}" with the tenant's webhook signing
+        secret, then sends the result in the `Stripe-Signature` header as
+        "t=<timestamp>,v1=<hex signature>" (Stripe can include more than
+        one v1 value during a secret-rotation window - we only check the
+        first one, which is enough for this project). We recompute the
+        same HMAC ourselves and compare.
+
+        `raw_body` MUST be the exact bytes Stripe sent, not a re-serialized
+        version of a parsed dict - see StripeWebhookView in
+        payments_core/views.py for why that matters and how we get it.
+
+        Raises PaymentProviderRequestError (the view catches this and turns
+        it into a 403) if the signature is missing, malformed, expired, or
+        doesn't match - never returns False, since there's nothing useful a
+        caller could do with a bare "no" here except immediately raise
+        anyway.
+        """
+        if not signature_header:
+            raise PaymentProviderRequestError("Missing Stripe-Signature header.")
+
+        # Stripe-Signature looks like "t=1614556800,v1=abcdef...,v0=...".
+        # Splitting on "," then on the first "=" gives us a dict of these
+        # short keys -> values.
+        parts = dict(item.split("=", 1) for item in signature_header.split(",") if "=" in item)
+        timestamp = parts.get("t")
+        signature = parts.get("v1")
+        if not timestamp or not signature:
+            raise PaymentProviderRequestError("Malformed Stripe-Signature header.")
+
+        if time.time() - int(timestamp) > STRIPE_WEBHOOK_AGE_TOLERANCE:
+            raise PaymentProviderRequestError("Stripe webhook timestamp is too old.")
+
+        signed_payload = f"{timestamp}.{raw_body.decode()}"
+        expected_signature = hmac.new(
+            webhook_secret.encode(), signed_payload.encode(), hashlib.sha256
+        ).hexdigest()
+
+        # hmac.compare_digest (NOT `==`) - a plain `==` string comparison
+        # stops as soon as it finds the first differing character, which
+        # means how LONG the comparison takes leaks information about how
+        # much of the signature we got right (a "timing attack").
+        # compare_digest always takes the same amount of time regardless of
+        # where the strings differ, closing that side channel.
+        if not hmac.compare_digest(expected_signature, signature):
+            raise PaymentProviderRequestError("Stripe webhook signature verification failed.")
+
+        return True
 
     def search_by_reference(self, payment_data):
-        """Mirrors Odoo's _search_by_reference(). Implemented in Phase 3."""
-        raise NotImplementedError("search_by_reference is implemented in Phase 3")
+        """
+        Mirrors Odoo's payment_stripe module's `_search_by_reference`.
+
+        Looks for a `reference` key in payment_data - this project passes
+        OUR OWN transaction reference through under that key (see
+        StripeWebhookView / StripeReturnView in payments_core/views.py,
+        which build it from Stripe's `client_reference_id` - the value we
+        set when CREATING the Checkout Session in
+        get_specific_processing_values() above), rather than trying to
+        derive it from a Stripe-specific id.
+        """
+        reference = payment_data.get("reference")
+        if not reference:
+            logger.warning("Stripe: received payment_data with no reference.")
+            return None
+
+        tx = PaymentTransaction.objects.filter(
+            reference=reference, provider__code="stripe"
+        ).first()
+        if tx is None:
+            logger.warning("Stripe: no transaction found matching reference '%s'.", reference)
+        return tx
 
     def apply_updates(self, transaction, payment_data):
         """
-        Mirrors Odoo's _apply_updates(). Implemented in Phase 3.
+        Mirrors Odoo's payment.transaction._apply_updates() override in the
+        payment_stripe module.
 
-        Stripe's flow in this project stays fully redirect-based for now
-        (see get_specific_processing_values above) - unlike Adyen, Stripe's
-        Checkout Session response never contains a final result on its own,
-        so there's no "immediate result" case to handle synchronously here.
-        This won't be exercised until Phase 3 wires up Stripe's webhook
-        handling, which is what actually tells us how the payment went.
+        Reads a Stripe PaymentIntent's `status` if we have one - preferred,
+        since PaymentIntent status is Stripe's most precise signal for this
+        - and falls back to reading a Checkout Session's `status` /
+        `payment_status` pair if that's what we actually have instead. This
+        project's return-URL and webhook handlers (see
+        payments_core/views.py) both pass Checkout Session data in
+        practice, since fetching a fully-expanded PaymentIntent would need
+        an extra Stripe API call this phase doesn't need; the PaymentIntent
+        branch exists for completeness and so this method works correctly
+        either way, regardless of which object a caller has on hand.
         """
-        # TODO: Phase 3
-        raise NotImplementedError("apply_updates is implemented in Phase 3")
+        payment_intent = payment_data.get("payment_intent")
+        checkout_session = payment_data.get("checkout_session")
+
+        if isinstance(payment_intent, dict) and payment_intent.get("status"):
+            if payment_intent.get("id"):
+                transaction.provider_reference = payment_intent["id"]
+
+            transition_method_name = STRIPE_PAYMENT_INTENT_STATUS_TRANSITIONS.get(
+                payment_intent["status"]
+            )
+            if transition_method_name is None:
+                logger.warning(
+                    "No state transition mapped for Stripe PaymentIntent status "
+                    "'%s' on transaction %s",
+                    payment_intent["status"],
+                    transaction.reference,
+                )
+                return
+
+            getattr(transaction, transition_method_name)(
+                state_message=f"Stripe PaymentIntent status: {payment_intent['status']}"
+            )
+            return
+
+        if isinstance(checkout_session, dict):
+            if checkout_session.get("id"):
+                transaction.provider_reference = checkout_session["id"]
+
+            session_status = checkout_session.get("status")
+            payment_status = checkout_session.get("payment_status")
+
+            if session_status == "complete" and payment_status in ("paid", "no_payment_required"):
+                transaction._set_done(
+                    state_message=f"Stripe checkout.session status: {session_status}/{payment_status}"
+                )
+            elif session_status == "expired":
+                transaction._set_canceled(state_message="Stripe checkout session expired")
+            elif session_status == "open":
+                # Still waiting on the customer - nothing to change; the
+                # transaction should already be "pending" from POST /payments/.
+                logger.info(
+                    "Stripe checkout session %s still open - no state change.",
+                    checkout_session.get("id"),
+                )
+            else:
+                logger.warning(
+                    "Unrecognized Stripe checkout session status/payment_status "
+                    "combination ('%s', '%s') on transaction %s",
+                    session_status,
+                    payment_status,
+                    transaction.reference,
+                )
+            return
+
+        logger.warning(
+            "Stripe apply_updates called with neither a payment_intent nor a "
+            "checkout_session for transaction %s",
+            transaction.reference,
+        )
 
     def extract_amount_data(self, transaction, payment_data):
-        """Mirrors Odoo's _extract_amount_data(). Implemented in Phase 3."""
-        raise NotImplementedError("extract_amount_data is implemented in Phase 3")
+        """
+        Mirrors Odoo's payment.transaction._extract_amount_data() override
+        in payment_stripe.
+
+        Pulls amount/currency out of whichever object we have (PaymentIntent
+        or Checkout Session - same payload duality as apply_updates above)
+        and converts from Stripe's minor units back to our major-unit
+        Decimal representation via to_major_currency_units().
+        """
+        payment_intent = payment_data.get("payment_intent")
+        checkout_session = payment_data.get("checkout_session")
+
+        if isinstance(payment_intent, dict) and payment_intent.get("amount") is not None:
+            minor_amount = payment_intent["amount"]
+            currency = (payment_intent.get("currency") or "").upper()
+        elif isinstance(checkout_session, dict) and checkout_session.get("amount_total") is not None:
+            minor_amount = checkout_session["amount_total"]
+            currency = (checkout_session.get("currency") or "").upper()
+        else:
+            return {"amount": None, "currency": None}
+
+        return {
+            "amount": to_major_currency_units(minor_amount, currency),
+            "currency": currency,
+        }
 
     def extract_token_values(self, transaction, payment_data):
         """Mirrors Odoo's _extract_token_values(). Implemented in Phase 3."""

@@ -63,8 +63,28 @@ class PaymentProviderAdapter(ABC):
         )
 
     @abstractmethod
-    def verify_webhook_signature(self, request):
-        """Verifies an incoming webhook actually came from the provider. Implemented in Phase 3."""
+    def verify_webhook_signature(self, *args, **kwargs):
+        """
+        Verifies an incoming webhook actually came from the provider, not
+        an attacker who just knows our webhook URL.
+
+        Unlike every other method on this interface, the exact parameters
+        here genuinely differ per adapter, because Stripe and Adyen sign
+        their webhooks in fundamentally different ways: Stripe computes ONE
+        HMAC over the whole raw request body, so its version takes
+        (raw_body, signature_header, webhook_secret) - see
+        StripeAdapter.verify_webhook_signature in payments_stripe/services.py.
+        Adyen signs EACH notification item individually using specific
+        fields out of that item, so its version takes
+        (notification_item, hmac_key) instead - see
+        AdyenAdapter.verify_webhook_signature in payments_adyen/services.py.
+        This method is declared with `*args, **kwargs` here (rather than a
+        made-up shared signature that wouldn't actually match either
+        implementation) specifically to acknowledge that difference - the
+        real contract is just "every adapter must expose a method with this
+        name that raises PaymentProviderRequestError on a bad signature",
+        not "with these exact parameters".
+        """
         raise NotImplementedError(
             "verify_webhook_signature is implemented per-adapter in Phase 3"
         )

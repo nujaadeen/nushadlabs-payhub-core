@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import requests
 
 from .exceptions import PaymentProviderRequestError
@@ -30,6 +32,26 @@ def to_minor_currency_units(amount, currency):
     """
     decimal_places = 0 if currency.upper() in ZERO_DECIMAL_CURRENCIES else 2
     return int(amount * (10 ** decimal_places))
+
+
+def to_major_currency_units(minor_amount, currency):
+    """
+    Mirrors Odoo's payment_utils.to_major_currency_units() - the inverse of
+    to_minor_currency_units() above. Converts an int amount in a currency's
+    smallest unit (what Stripe/Adyen's APIs report back to US, in webhooks
+    and return-URL responses) into a Decimal in that currency's everyday
+    major-unit representation - the same representation
+    PaymentTransaction.amount stores, so the two can be compared directly.
+
+    Returns a Decimal, not a float, for the same reason
+    to_minor_currency_units takes a Decimal in the other direction: floats
+    can't represent most decimal fractions exactly, which could make a
+    perfectly correct amount look like a mismatch (or vice versa) purely
+    from floating-point rounding when _validate_amount compares this
+    against self.amount.
+    """
+    decimal_places = 0 if currency.upper() in ZERO_DECIMAL_CURRENCIES else 2
+    return Decimal(minor_amount) / (10 ** decimal_places)
 
 
 def send_provider_api_request(method, url, headers=None, data=None, json=None, timeout=30):

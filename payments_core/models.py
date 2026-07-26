@@ -1,3 +1,4 @@
+import logging
 import re
 import uuid
 
@@ -7,6 +8,53 @@ from django.utils import timezone
 from tenants.models import Customer, Tenant
 
 from .exceptions import PaymentProviderRequestError
+
+logger = logging.getLogger(__name__)
+
+
+def _get_adapter_for_provider_code(provider_code):
+    """
+    Looks up and instantiates the PaymentProviderAdapter subclass matching
+    `provider_code`. This is a module-level function (not a method) because
+    it's needed from TWO different places that don't both have a
+    transaction instance to work with:
+      - PaymentTransaction._get_adapter() (an instance method) - when we
+        already have a transaction and want ITS provider's adapter.
+      - PaymentTransaction._search_by_reference() (a classmethod) - called
+        BEFORE we've found a transaction at all (finding one IS the whole
+        point of that method), so there's no `self.provider.code` to read.
+    Rather than duplicate this if/elif in both places, it lives here once.
+
+    In Odoo, this dispatch happens implicitly via `_inherit`: each provider
+    module (payment_stripe, payment_adyen) patches its own version of
+    methods like `_get_specific_processing_values` onto payment.transaction,
+    and Odoo's ORM automatically calls the right override based on which
+    modules are installed. Django has no equivalent to `_inherit` - so we
+    reproduce the same "run the right code for this provider" behavior
+    ourselves, explicitly. This if/elif IS our whole "override registry" -
+    it's the one place that would grow if we added a third provider.
+
+    The adapter class imports below are deliberately INSIDE this function
+    (not at the top of this file) to avoid a circular import: this file
+    (payments_core/models.py) would import payments_stripe.services, which
+    imports payments_stripe.models (for PaymentProviderStripeConfig), which
+    itself imports PaymentProvider FROM payments_core.models - i.e. right
+    back into the module that's still in the middle of being defined.
+    Python can't resolve that at import time. Importing inside the function
+    instead delays the import until it actually RUNS (by which point
+    payments_core.models has finished loading), which sidesteps the cycle
+    entirely.
+    """
+    if provider_code == "stripe":
+        from payments_stripe.services import StripeAdapter
+
+        return StripeAdapter()
+    elif provider_code == "adyen":
+        from payments_adyen.services import AdyenAdapter
+
+        return AdyenAdapter()
+
+    raise PaymentProviderRequestError(f"No adapter registered for provider code '{provider_code}'.")
 
 
 class PaymentProvider(models.Model):
@@ -356,48 +404,12 @@ class PaymentTransaction(models.Model):
 
     def _get_adapter(self):
         """
-        Looks up and instantiates the PaymentProviderAdapter subclass that
-        matches `self.provider.code`.
-
-        In Odoo, this dispatch happens implicitly: each provider module
-        (payment_stripe, payment_adyen) uses `_inherit` to patch its own
-        version of methods like `_get_specific_processing_values` onto
-        payment.transaction, and Odoo's ORM automatically calls the right
-        override based on which modules are installed. Django has no
-        equivalent to `_inherit` - there's no way for payments_stripe to
-        "reopen" this class and add a Stripe-specific method version. So
-        instead we reproduce the same "run the right code for this
-        provider" behavior ourselves, explicitly: look at
-        `self.provider.code` and pick the matching adapter class by hand.
-        This if/elif is our whole "override registry" - it's the one place
-        that would grow if we added a third provider. Both
-        _get_specific_processing_values and _apply_updates below need this
-        same lookup, so it lives here once instead of being duplicated in
-        each.
-
-        The adapter class imports below are deliberately INSIDE this method
-        (not at the top of this file) to avoid a circular import: this file
-        (payments_core/models.py) would import payments_stripe.services,
-        which imports payments_stripe.models (for
-        PaymentProviderStripeConfig), which itself imports PaymentProvider
-        FROM payments_core.models - i.e. right back into the module that's
-        still in the middle of being defined. Python can't resolve that at
-        import time. Importing inside the method instead delays the import
-        until this method actually RUNS (by which point payments_core.models
-        has finished loading), which sidesteps the cycle entirely.
+        Instance-method convenience wrapper around the module-level
+        _get_adapter_for_provider_code() (see its docstring near the top of
+        this file for the full explanation of this dispatch pattern) -
+        reads the provider code off THIS transaction's own provider.
         """
-        if self.provider.code == "stripe":
-            from payments_stripe.services import StripeAdapter
-
-            return StripeAdapter()
-        elif self.provider.code == "adyen":
-            from payments_adyen.services import AdyenAdapter
-
-            return AdyenAdapter()
-
-        raise PaymentProviderRequestError(
-            f"No adapter registered for provider code '{self.provider.code}'."
-        )
+        return _get_adapter_for_provider_code(self.provider.code)
 
     def _get_specific_processing_values(self):
         """
@@ -412,24 +424,84 @@ class PaymentTransaction(models.Model):
     @classmethod
     def _process(cls, provider_code, payment_data):
         """
-        Mirrors Odoo's payment.transaction._process().
+        Mirrors Odoo's payment.transaction._process() - the central entry
+        point every asynchronous notification (a webhook, or the customer
+        returning from a redirect) funnels through to actually update a
+        transaction's state. This is the single most important method in
+        the whole payment pipeline: everything upstream (creating the
+        transaction, sending the payment request) exists to set up a
+        transaction that CAN be found and processed here; everything
+        downstream (webhooks, return URLs - see payments_core/views.py)
+        exists to CALL this, with whatever payload shape their provider
+        gave them.
 
-        Entry point called after a provider notifies us of a payment result
-        (e.g. via webhook or redirect return). Looks up the matching
-        transaction and applies the update. Implemented in Phase 3.
+        Mirrors Odoo's version in shape, with two pieces intentionally left
+        out:
+          - Odoo's version also calls `tx.tokenize(...)` when `tx.tokenize`
+            is True, to save the payment method for reuse. We don't - that
+            stays deferred to a later phase (see the _tokenize /
+            _extract_token_values stubs below), and this project's
+            PaymentTransaction.tokenize is always False anyway (see
+            _get_processing_values' TODO comment above).
+          - Odoo also sends a real-time notification over its "bus" (a
+            websocket-based pub/sub system) so an open browser tab showing
+            a payment status page updates itself live. We're a pure JSON
+            API with no frontend to notify - GET /payments/{id}/ is polled
+            instead - so there's nothing to send here.
         """
-        raise NotImplementedError("Implemented in Phase 3")
+        tx = cls._search_by_reference(provider_code, payment_data)
+        if tx is None:
+            logger.warning(
+                "PaymentTransaction._process: no transaction found for "
+                "provider_code=%s, payment_data=%s",
+                provider_code,
+                payment_data,
+            )
+            return None
+
+        tx._apply_updates(payment_data)
+
+        if tx.state in ("authorized", "done"):
+            # Only bother validating the amount once the provider claims
+            # the payment actually went through (fully or provisionally) -
+            # no point checking amounts on a transaction that's still
+            # pending or already failed.
+            tx._validate_amount(payment_data)
+
+        # A plain, full save() (no update_fields) - deliberately, unlike
+        # _update_state's targeted save above. _apply_updates() may have
+        # set attributes (like provider_reference) directly on `tx` without
+        # saving them itself (its state-transition call, if any, only
+        # persists the state-related fields - see _update_state), so this
+        # final save is what actually flushes whatever DID change, however
+        # many or few fields that turned out to be.
+        tx.save()
+        return tx
 
     @classmethod
     def _search_by_reference(cls, provider_code, payment_data):
         """
         Mirrors Odoo's payment.transaction._search_by_reference().
 
-        Given the raw payload a provider sent us, find the PaymentTransaction
-        it refers to (each adapter knows where in its own payload shape the
-        reference lives). Implemented in Phase 3.
+        Dispatches to the adapter matching `provider_code` (via the
+        module-level _get_adapter_for_provider_code() near the top of this
+        file - NOT the instance method _get_adapter(), since this is a
+        classmethod: there's no transaction instance yet to read a provider
+        code off of - finding one IS the whole point of this method). Each
+        adapter knows where in ITS OWN payload shape the reference actually
+        lives (see StripeAdapter.search_by_reference /
+        AdyenAdapter.search_by_reference).
         """
-        raise NotImplementedError("Implemented in Phase 3")
+        try:
+            adapter = _get_adapter_for_provider_code(provider_code)
+        except PaymentProviderRequestError:
+            logger.warning(
+                "_search_by_reference: no adapter registered for provider_code '%s'.",
+                provider_code,
+            )
+            return None
+
+        return adapter.search_by_reference(payment_data)
 
     def _apply_updates(self, payment_data):
         """
@@ -441,12 +513,12 @@ class PaymentTransaction(models.Model):
         _get_adapter() lookup _get_specific_processing_values uses above) -
         each adapter knows how to read its own provider's payload shape.
 
-        Right now this is only actually exercised by AdyenAdapter, for the
-        case where Adyen returns a final result immediately instead of
-        requiring a redirect (see AdyenAdapter.get_specific_processing_values
-        in payments_adyen/services.py). Stripe's adapter, and the
-        webhook-driven paths for both providers, still raise
-        NotImplementedError here - that's Phase 3 work.
+        Called from three different places, all funneling through
+        _process() above: Adyen's synchronous /payments response (when it
+        completes immediately - see AdyenAdapter.get_specific_processing_values),
+        and - as of this phase - both providers' webhooks and Stripe's/
+        Adyen's return-URL flows (see payments_core/views.py). This method
+        itself doesn't need to know or care which of those triggered it.
         """
         self._get_adapter().apply_updates(self, payment_data)
 
@@ -454,20 +526,46 @@ class PaymentTransaction(models.Model):
         """
         Mirrors Odoo's payment.transaction._validate_amount().
 
-        Confirms the amount the provider says was charged actually matches
-        what we expected to charge, guarding against tampering. Implemented
-        in Phase 3.
+        Confirms the amount/currency the provider says was charged actually
+        matches what we expected to charge (self.amount/self.currency),
+        guarding against a tampered notification claiming a smaller amount
+        was paid than we asked for. Called from _process() above, only once
+        a transaction has reached "authorized" or "done" - no point
+        checking amounts on a transaction that's still pending or has
+        already failed for an unrelated reason.
         """
-        raise NotImplementedError("Implemented in Phase 3")
+        amount_data = self._extract_amount_data(payment_data)
+        extracted_amount = amount_data.get("amount")
+        extracted_currency = amount_data.get("currency")
+
+        if extracted_amount is None or extracted_currency is None:
+            # This payload didn't actually contain an amount/currency we
+            # could extract (e.g. a webhook event type that doesn't carry
+            # one) - nothing to compare, so there's nothing to flag.
+            return
+
+        if extracted_amount != self.amount or extracted_currency != self.currency:
+            # _set_error can be called from "authorized"/"done" specifically
+            # BECAUSE of this case - see _set_error's docstring below for
+            # why those two states had to be added to its allowed source
+            # states in this phase.
+            self._set_error(
+                f"Amount or currency mismatch: expected {self.amount} {self.currency}, "
+                f"provider reported {extracted_amount} {extracted_currency}."
+            )
 
     def _extract_amount_data(self, payment_data):
         """
         Mirrors Odoo's payment.transaction._extract_amount_data().
 
-        Pulls the amount/currency fields out of a provider-specific payload
-        shape into our normalized representation. Implemented in Phase 3.
+        Dispatches to the adapter (same _get_adapter() lookup as
+        _get_specific_processing_values/_apply_updates above) - each
+        adapter knows where in its own payload shape the amount/currency
+        actually live, and returns them already converted to our
+        major-unit Decimal representation (see to_major_currency_units in
+        payments_core/utils.py).
         """
-        raise NotImplementedError("Implemented in Phase 3")
+        return self._get_adapter().extract_amount_data(self, payment_data)
 
     def _tokenize(self, payment_data):
         """
@@ -540,61 +638,85 @@ class PaymentTransaction(models.Model):
         """
         Mirrors Odoo's payment.transaction._set_authorized().
 
-        Allowed source states (Odoo): 'draft', 'pending'. Implemented in
-        Phase 3, once webhooks exist to actually drive this transition.
+        Allowed source states: 'draft', 'pending' - matches Odoo exactly.
+        "Authorized" means the provider has reserved/approved the payment
+        but the money hasn't actually moved yet - that only happens on a
+        manual capture (payment.provider.capture_manually /
+        PaymentProvider.capture_manually). We don't implement sending a
+        capture request yet (see StripeAdapter/AdyenAdapter.send_capture_request,
+        still Phase 3+ stubs), so nothing in THIS project currently drives a
+        transaction to "authorized" - but the state has to exist and be
+        reachable now so the state machine's shape is already correct for
+        when capture support is added, rather than needing a state-machine
+        change alongside a capture-flow change later.
         """
-        raise NotImplementedError("Implemented in Phase 3")
+        self._update_state(
+            allowed_states=("draft", "pending"), target_state="authorized", state_message=state_message
+        )
 
     def _set_done(self, state_message=None):
         """
         Mirrors Odoo's payment.transaction._set_done().
 
-        Allowed source states: 'draft', 'pending' - same simplified,
-        single-instance version of Odoo's allowed-source-states pattern as
-        _set_pending/_set_error above (see _update_state's docstring for
-        why this checks one instance instead of a whole recordset like
-        Odoo does). Odoo actually allows this transition from 'draft',
-        'pending', 'authorized', OR 'error' too - we only allow
-        'draft'/'pending' for now because 'authorized' isn't reachable yet
-        in this project (there's no capture flow, so nothing ever produces
-        an authorized transaction), and nothing here retries a failed
-        ('error') transaction back to done. This will need to grow once
-        those exist.
+        Allowed source states: 'draft', 'pending', 'authorized' - matches
+        Odoo (which also allows 'error', for a transaction that failed and
+        was later corrected; we don't have a path that re-drives an
+        'error' transaction back to 'done' in this project, so we leave
+        that one out). 'authorized' had to be added in this phase: once
+        _set_authorized (above) makes "authorized" reachable, a manual
+        capture completing would move a transaction from "authorized"
+        straight to "done" - we don't implement sending capture requests
+        yet either, but again, the state machine's SHAPE should already be
+        correct.
 
-        This is what AdyenAdapter.apply_updates calls when Adyen's
-        /payments response comes back with resultCode "Authorised" and no
-        redirect needed (see payments_adyen/services.py) - the first case
-        in this project where a transaction reaches "done" WITHOUT ever
-        passing through "pending" first, which is exactly why 'draft' has
-        to be in the allowed source states here, not just 'pending'.
+        'draft' stays in the allowed states too because of Adyen's
+        immediate-response case (see AdyenAdapter.get_specific_processing_values
+        in payments_adyen/services.py) - the one case in this project where
+        a transaction reaches "done" WITHOUT ever passing through "pending"
+        first.
         """
         self._update_state(
-            allowed_states=("draft", "pending"), target_state="done", state_message=state_message
+            allowed_states=("draft", "pending", "authorized"),
+            target_state="done",
+            state_message=state_message,
         )
 
     def _set_canceled(self, state_message=None):
         """
         Mirrors Odoo's payment.transaction._set_canceled().
 
-        Allowed source states (Odoo): 'draft', 'pending', 'authorized'.
-        Implemented in Phase 3, once webhooks exist to actually drive this
-        transition.
+        Allowed source states: 'draft', 'pending', 'authorized' - matches
+        Odoo exactly. A transaction can be canceled by the customer
+        abandoning a redirect/3DS challenge (still 'pending'), or by the
+        provider canceling an authorized-but-not-yet-captured payment.
         """
-        raise NotImplementedError("Implemented in Phase 3")
+        self._update_state(
+            allowed_states=("draft", "pending", "authorized"),
+            target_state="cancel",
+            state_message=state_message,
+        )
 
     def _set_error(self, state_message):
         """
         Mirrors Odoo's payment.transaction._set_error().
 
-        Allowed source states (Odoo): any state except 'done' can move to
-        'error'. This phase only ever calls _set_error right after trying
-        (and failing) to create the payment request via POST /payments/, so
-        we only allow it from 'draft' or 'pending' for now - Odoo allows it
-        from more states because it has more transition paths (capture/
-        refund failures, etc.) than this project has built yet.
+        Allowed source states: 'draft', 'pending', 'authorized', 'done'.
+        Phase 2 only ever called this right after a failed adapter call (so
+        only 'draft'/'pending' were reachable then). This phase adds
+        'authorized' and 'done' too, specifically because of
+        _validate_amount above: if a provider reports a DIFFERENT amount
+        than we expected, we need to be able to flag that as an error even
+        AFTER the transaction has already reached "authorized" or "done" -
+        an amount mismatch on an already-"done" transaction is exactly the
+        kind of thing 'error' needs to be reachable from, since it might
+        indicate the notification was tampered with. We still don't allow
+        'cancel' -> 'error' or 'error' -> 'error', since nothing in this
+        project needs those transitions.
         """
         self._update_state(
-            allowed_states=("draft", "pending"), target_state="error", state_message=state_message
+            allowed_states=("draft", "pending", "authorized", "done"),
+            target_state="error",
+            state_message=state_message,
         )
 
     def _create_child_transaction(self, amount, is_refund=False):
