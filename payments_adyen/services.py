@@ -1,10 +1,10 @@
 import base64
 import hashlib
 import hmac
-import logging
 
 from payments_core.exceptions import PaymentProviderRequestError
 from payments_core.interfaces import PaymentProviderAdapter
+from payments_core.logging_utils import get_masked_logger, mask_sensitive
 from payments_core.utils import send_provider_api_request, to_major_currency_units, to_minor_currency_units
 
 from . import const
@@ -15,7 +15,10 @@ from . import const
 # import for the full explanation.
 from payments_core.models import PaymentTransaction
 
-logger = logging.getLogger(__name__)
+# get_masked_logger(name, sensitive_keys=...) instead of plain
+# logging.getLogger(__name__) - see payments_stripe/services.py's own
+# logger line for the full explanation (same rationale applies here).
+logger = get_masked_logger(__name__, sensitive_keys=const.SENSITIVE_KEYS)
 
 # Adyen versions each API endpoint (v66, v68, v71, ...) and expects that
 # version number baked right into the URL. Odoo keeps a whole const.py
@@ -25,13 +28,13 @@ logger = logging.getLogger(__name__)
 # endpoints, all on the same version.
 #
 # NOTE: this project no longer calls plain /payments (see
-# get_specific_processing_values below for why) - only /payments/details
+# _get_specific_processing_values below for why) - only /payments/details
 # (the 3DS-continuation endpoint used by AdyenPaymentsDetailsView/
 # AdyenReturnView in payments_core/views.py) still uses this version.
 ADYEN_API_VERSION = "v71"
 ADYEN_TEST_PAYMENTS_DETAILS_URL = f"https://checkout-test.adyen.com/{ADYEN_API_VERSION}/payments/details"
 
-# The Sessions endpoint used by get_specific_processing_values below - see
+# The Sessions endpoint used by _get_specific_processing_values below - see
 # that method's docstring for why this project uses Sessions (specifically
 # Hosted Checkout mode) instead of the raw /payments endpoint above.
 # Pinned to a NEWER version than ADYEN_API_VERSION deliberately: Adyen's
@@ -50,9 +53,9 @@ ADYEN_SESSIONS_URL = f"https://checkout-test.adyen.com/{ADYEN_SESSIONS_API_VERSI
 # The Adyen resultCodes this project currently knows how to react to, and
 # which PaymentTransaction state-transition method each one maps to. This
 # is a deliberately small subset of Odoo's full const.RESULT_CODES_MAPPING
-# - just enough to cover the cases AdyenAdapter.apply_updates actually
+# - just enough to cover the cases AdyenAdapter._apply_updates actually
 # needs right now. Anything not in this dict is left alone (see
-# apply_updates below) rather than guessed at.
+# _apply_updates below) rather than guessed at.
 ADYEN_RESULT_CODE_TRANSITIONS = {
     "Authorised": "_set_done",
     "Refused": "_set_error",
@@ -64,7 +67,7 @@ ADYEN_RESULT_CODE_TRANSITIONS = {
 def adyen_event_to_result_code(event_code, success):
     """
     Maps an Adyen webhook notification's (eventCode, success) pair to the
-    equivalent `resultCode` our AdyenAdapter.apply_updates / the
+    equivalent `resultCode` our AdyenAdapter._apply_updates / the
     ADYEN_RESULT_CODE_TRANSITIONS mapping already knows how to react to.
 
     No leading underscore (unlike _compute_adyen_hmac_signature below,
@@ -78,7 +81,7 @@ def adyen_event_to_result_code(event_code, success):
     translate one shape into the other here, right at the door, so the
     rest of the pipeline (_apply_updates) only ever has to understand
     `resultCode`, regardless of which of Adyen's three response mechanisms
-    (see AdyenAdapter.get_specific_processing_values) actually produced it.
+    (see AdyenAdapter._get_specific_processing_values) actually produced it.
 
     Mirrors Odoo's own webhook event-code remapping. Returns None for an
     event code we don't have a mapping for at all, which tells the caller
@@ -175,7 +178,7 @@ def get_feature_support_fields(provider):
     Nothing beyond payment creation is implemented for Adyen yet, so every
     key below stays "not_implemented".
 
-    # Phase 2/3 TODO: once send_capture_request / send_refund_request /
+    # Phase 2/3 TODO: once _send_capture_request / _send_refund_request /
     # tokenization / express checkout are actually implemented for Adyen,
     # flip the matching key here (e.g. support_refund = "full") - this
     # function is the one place that needs to change.
@@ -192,25 +195,25 @@ class AdyenAdapter(PaymentProviderAdapter):
     method to even be instantiable" rule applies here as it does for
     StripeAdapter - see that class's docstring in
     payments_stripe/services.py for the full explanation (including the
-    one non-abstract exception, get_supported_currencies, overridden below).
+    one non-abstract exception, _get_supported_currencies, overridden below).
 
     Phase 2 implements the "online_redirect" flow only:
-    get_specific_processing_values() (calls Adyen's /payments endpoint
-    directly, via `requests`) and send_payment_request() (a thin wrapper
+    _get_specific_processing_values() (calls Adyen's /payments endpoint
+    directly, via `requests`) and _send_payment_request() (a thin wrapper
     around it). Every other method below is still a stub.
     """
 
-    def get_supported_currencies(self):
+    def _get_supported_currencies(self):
         """
         Mirrors Odoo's payment_adyen module overriding
         payment.provider._get_supported_currencies() - same rationale as
-        StripeAdapter.get_supported_currencies in
+        StripeAdapter._get_supported_currencies in
         payments_stripe/services.py. The actual list of codes lives in
         payments_adyen/const.py.
         """
         return const.SUPPORTED_CURRENCIES
 
-    def get_specific_processing_values(self, transaction):
+    def _get_specific_processing_values(self, transaction):
         """
         Uses Adyen's Sessions API (Hosted Checkout mode), NOT Odoo's
         payment_adyen approach of calling /payments directly - a deliberate,
@@ -289,6 +292,11 @@ class AdyenAdapter(PaymentProviderAdapter):
                 "Content-Type": "application/json",
             },
             json=payload,
+            # const.SENSITIVE_KEYS masks this "X-API-Key" header before
+            # send_provider_api_request logs the request - see that
+            # function's own docstring, and const.SENSITIVE_KEYS' comment,
+            # for the full explanation.
+            sensitive_keys=const.SENSITIVE_KEYS,
         )
 
         redirect_url = data.get("url")
@@ -310,33 +318,33 @@ class AdyenAdapter(PaymentProviderAdapter):
             # later via the webhook's AUTHORISATION notification, same as
             # Stripe's flow only having a Checkout Session id up front, not
             # a PaymentIntent id). Matches the pattern
-            # StripeAdapter.get_specific_processing_values uses for storing
+            # StripeAdapter._get_specific_processing_values uses for storing
             # its own Checkout Session id as provider_reference.
             "provider_reference": data.get("id"),
             "raw_response": data,
         }
 
-    def send_payment_request(self, transaction):
+    def _send_payment_request(self, transaction):
         """
         Mirrors Odoo's payment.transaction._send_payment_request(). Same
-        simplification as StripeAdapter.send_payment_request() - see that
+        simplification as StripeAdapter._send_payment_request() - see that
         method's docstring in payments_stripe/services.py.
         """
-        return self.get_specific_processing_values(transaction)
+        return self._get_specific_processing_values(transaction)
 
-    def send_capture_request(self, transaction):
+    def _send_capture_request(self, transaction):
         """Mirrors Odoo's _send_capture_request(). Implemented in Phase 3."""
-        raise NotImplementedError("send_capture_request is implemented in Phase 3")
+        raise NotImplementedError("_send_capture_request is implemented in Phase 3")
 
-    def send_void_request(self, transaction):
+    def _send_void_request(self, transaction):
         """Mirrors Odoo's _send_void_request(). Implemented in Phase 3."""
-        raise NotImplementedError("send_void_request is implemented in Phase 3")
+        raise NotImplementedError("_send_void_request is implemented in Phase 3")
 
-    def send_refund_request(self, transaction):
+    def _send_refund_request(self, transaction):
         """Mirrors Odoo's _send_refund_request(). Implemented in Phase 3."""
-        raise NotImplementedError("send_refund_request is implemented in Phase 3")
+        raise NotImplementedError("_send_refund_request is implemented in Phase 3")
 
-    def verify_webhook_signature(self, notification_item, hmac_key):
+    def _verify_webhook_signature(self, notification_item, hmac_key):
         """
         Mirrors Odoo's payment_adyen webhook signature check.
 
@@ -358,14 +366,14 @@ class AdyenAdapter(PaymentProviderAdapter):
 
         expected_signature = _compute_adyen_hmac_signature(notification_item, hmac_key)
 
-        # hmac.compare_digest, not `==` - see StripeAdapter.verify_webhook_signature
+        # hmac.compare_digest, not `==` - see StripeAdapter._verify_webhook_signature
         # in payments_stripe/services.py for why (timing-attack resistance).
         if not hmac.compare_digest(expected_signature, provided_signature):
             raise PaymentProviderRequestError("Adyen webhook signature verification failed.")
 
         return True
 
-    def search_by_reference(self, payment_data):
+    def _search_by_reference(self, payment_data):
         """
         Mirrors Odoo's payment_adyen module's `_search_by_reference`.
 
@@ -413,7 +421,7 @@ class AdyenAdapter(PaymentProviderAdapter):
             )
         return tx
 
-    def apply_updates(self, transaction, payment_data):
+    def _apply_updates(self, transaction, payment_data):
         """
         Mirrors Odoo's payment.transaction._apply_updates() override in the
         payment_adyen module.
@@ -429,7 +437,7 @@ class AdyenAdapter(PaymentProviderAdapter):
         into a resultCode via adyen_event_to_result_code before calling
         this - see AdyenWebhookView in payments_core/views.py). This method
         doesn't care WHERE `payment_data` came from, only what's in it -
-        which is exactly why switching get_specific_processing_values above
+        which is exactly why switching _get_specific_processing_values above
         to the Sessions API (no more synchronous resultCode from creation
         itself, only from the webhook or /payments/details afterward)
         needed no changes here at all: it was already payload-shape-driven,
@@ -467,7 +475,7 @@ class AdyenAdapter(PaymentProviderAdapter):
         transition_method = getattr(transaction, transition_method_name)
         transition_method(state_message=f"Adyen resultCode: {result_code}")
 
-    def extract_amount_data(self, transaction, payment_data):
+    def _extract_amount_data(self, transaction, payment_data):
         """
         Mirrors Odoo's payment.transaction._extract_amount_data() override
         in payment_adyen.
@@ -491,6 +499,6 @@ class AdyenAdapter(PaymentProviderAdapter):
             "currency": currency.upper(),
         }
 
-    def extract_token_values(self, transaction, payment_data):
+    def _extract_token_values(self, transaction, payment_data):
         """Mirrors Odoo's _extract_token_values(). Implemented in Phase 3."""
-        raise NotImplementedError("extract_token_values is implemented in Phase 3")
+        raise NotImplementedError("_extract_token_values is implemented in Phase 3")

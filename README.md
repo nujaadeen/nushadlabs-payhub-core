@@ -833,3 +833,119 @@ Adyen's redirect-based flow works the same way Stripe's does above - open
 and the webhook (or return-URL call - see the "known follow-up" note above
 about that path's current continuation-endpoint mismatch) drives the
 transaction to `"done"`.
+
+## Idempotency & Hardening
+
+This phase didn't add any new business capability, endpoint, or change any
+existing request/response shape - it solidified behavior that was already
+supposed to exist, closing a few real gaps in how safely this project
+handles being called more than once, and tightened naming fidelity to
+Odoo. No model fields changed either - `is_post_processed` already existed
+from Phase 0, so `python manage.py migrate` has nothing new to apply.
+
+### Webhook idempotency - no event-dedup table
+
+Stripe and Adyen both retry webhook deliveries that don't get a fast
+enough 2xx response, and can just send the same event/notification twice
+regardless of timing. This project does **not** handle that with a
+separate "have I already processed this event?" table - neither does
+Odoo. Idempotency instead falls directly out of
+`PaymentTransaction._update_state` (`payments_core/models.py`), which
+every `_set_pending`/`_set_done`/`_set_error`/etc. call goes through:
+
+```python
+if self.state == target_state:
+    logger.info("Skipped the update of transaction %s as it is already in state %s.", ...)
+    return self
+if self.state not in allowed_states:
+    logger.warning("Refused to update transaction %s from state %s to state %s; ...", ...)
+    return self
+# ... an actual transition happens here, and is_post_processed is reset to False
+```
+
+A second webhook for an already-`"done"` transaction hits the first
+check, gets logged at INFO (this is normal, expected traffic - not an
+error), and returns without touching the row again. A transition to a
+state the transaction can't currently reach from hits the second check
+and is logged at WARNING, also without raising - both guards `return
+self` rather than raising an exception, a deliberate change from an
+earlier version of this method that used to `raise ValueError` for the
+second case (see the method's own docstring in `models.py` for the full
+reasoning: a webhook caller has no useful way to "fix" an unexpected
+transition and retry anyway).
+
+**Unmatched references** (a webhook whose reference doesn't match any
+transaction) are a separate, already-existing safeguard from Phase 3.7,
+confirmed still correct here: both webhook views acknowledge with a plain
+`200` and do nothing, rather than 404ing or erroring - see "Webhook URLs
+are fixed" above.
+
+**`_post_process` / `is_post_processed`**: mirrors Odoo's
+`payment.transaction._post_process()` - called at the end of `_process()`,
+after `_apply_updates`/`_validate_amount`, and simply flags
+`is_post_processed = True`. `_update_state` resets it back to `False` on
+every ACTUAL state transition (not on the skip/refuse cases above), so a
+transaction that changes state more than once (e.g. `done` → `error` via
+a later amount-mismatch check) gets flagged for post-processing again
+rather than staying marked from its first pass. No cron/Celery job
+processes stuck-`pending` transactions yet - see the
+`# TODO: consider a periodic reconciliation job...` comment next to
+`_post_process` (mirrors Odoo's own `_cron_post_process`) for why that's
+explicitly out of scope rather than silently missing.
+
+### Reference collision handling
+
+`PaymentTransaction._compute_reference` reads existing references and
+computes the next suffix in Python, then `POST /payments/`'s view does a
+separate `create()` call afterward - a small race window exists if two
+requests for the *same tenant* land in that window at nearly the same
+instant. Mirroring Odoo's own approach: the database's `(tenant,
+reference)` unique constraint (`PaymentTransaction.Meta`) is the actual
+source of truth, not anything preventing the race in application code.
+`PaymentListCreateView.post()` catches the resulting `IntegrityError` and
+retries the whole compute-then-create step once; losing that retry too
+(vanishingly unlikely) returns a `409 Conflict`. No `select_for_update()`
+or similar locking - payment creation isn't a high-enough-frequency hot
+path here to justify it.
+
+### Sensitive-field log masking
+
+`payments_core/logging_utils.py` adds `mask_sensitive(data, sensitive_keys)`
+(returns a masked shallow copy, never mutates the original) and
+`get_masked_logger(name, sensitive_keys=...)` (a completely standard
+Python logger, with `sensitive_keys` attached as a convenience attribute).
+This is a deliberately simplified, **explicitly-called** version of
+Odoo's `get_payment_logger` - Odoo's real version hooks into Python's
+logging system globally so every log call gets masked automatically; this
+project's version only masks where a call site actually calls
+`mask_sensitive()` first. Each provider's real credential field names
+live in its own `SENSITIVE_KEYS` constant (`payments_stripe/const.py`,
+`payments_adyen/const.py`) - applied to the outbound request/response
+logging in `send_provider_api_request` (`payments_core/utils.py`,
+including the `Authorization`/`X-API-Key` headers that actually carry
+each provider's secret) and to incoming webhook payload logging in both
+webhook views.
+
+### Naming fidelity to Odoo
+
+Every adapter interface method (`payments_core/interfaces.py`,
+`payments_stripe/services.py`, `payments_adyen/services.py`) is now
+prefixed with a leading underscore, matching Odoo's real method names on
+`payment.provider`/`payment.transaction` exactly (e.g. Odoo's actual
+method is `_get_specific_processing_values`, not
+`get_specific_processing_values`). This is a naming convention only -
+Python has no enforced privacy the way some frameworks do, and neither
+does Odoo's own underscore convention; it's there so a reader who already
+knows Odoo's payment framework can match a method here to its Odoo
+equivalent by name alone. `_search_by_reference` exists at BOTH layers
+(the `PaymentTransaction` classmethod, unchanged from Phase 3, and each
+adapter's own instance method, renamed this phase) - this isn't a
+collision, it mirrors Odoo's own two-layer structure where the model
+method dispatches to a provider-specific override of the same name.
+Webhook signature verification (`_verify_webhook_signature`) stays on the
+adapter here rather than moving to the view/controller layer the way
+Odoo splits it (Stripe's `_verify_signature` and Adyen's
+`_compute_signature` both live on Odoo's controllers, not its models) -
+a deliberate, reasonable structural difference, not a fidelity gap; see
+`PaymentProviderAdapter._verify_webhook_signature`'s own docstring for
+the full reasoning.

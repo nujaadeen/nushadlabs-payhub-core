@@ -22,7 +22,7 @@ class PaymentProviderAdyenConfig(models.Model):
     adyen_client_key = models.CharField(max_length=255)  # stored raw for now, encrypt later
     adyen_hmac_key = models.CharField(max_length=255)  # stored raw for now, encrypt later
     # Required for the Hosted Checkout flow this project uses (see
-    # AdyenAdapter.get_specific_processing_values in payments_adyen/
+    # AdyenAdapter._get_specific_processing_values in payments_adyen/
     # services.py for the full explanation of why we use Hosted Checkout at
     # all). Unlike the other fields above, this ISN'T a secret credential -
     # it's an id Adyen assigns when a merchant creates a "theme" (page
@@ -31,7 +31,7 @@ class PaymentProviderAdyenConfig(models.Model):
     # step per Adyen merchant account, confirmed against Adyen's current
     # Hosted Checkout integration docs while building this. null=True/
     # blank=True because a provider row can exist before this manual step
-    # has been done - get_specific_processing_values raises a clear error
+    # has been done - _get_specific_processing_values raises a clear error
     # if a payment is actually attempted without it, rather than failing
     # confusingly inside the Adyen API call.
     adyen_theme_id = models.CharField(max_length=255, null=True, blank=True)

@@ -3,8 +3,8 @@
 # This mirrors the kind of constant Odoo keeps in its own
 # payment_stripe/const.py file: a plain, hardcoded list baked into the
 # adapter's own code, NOT something read from a database column or
-# configured per-tenant (see StripeAdapter.get_supported_currencies in
-# services.py, and PaymentProviderAdapter.get_supported_currencies in
+# configured per-tenant (see StripeAdapter._get_supported_currencies in
+# services.py, and PaymentProviderAdapter._get_supported_currencies in
 # payments_core/interfaces.py, for the full "why a constant, not a field"
 # reasoning).
 #
@@ -27,8 +27,8 @@ SUPPORTED_CURRENCIES = [
 
 # Stripe event `type` values where event["data"]["object"] is genuinely a
 # Checkout Session (i.e. it actually has fields like client_reference_id,
-# status, payment_status - see StripeAdapter.apply_updates/
-# extract_amount_data in services.py, and StripeWebhookView in
+# status, payment_status - see StripeAdapter._apply_updates/
+# _extract_amount_data in services.py, and StripeWebhookView in
 # payments_core/views.py).
 #
 # Unlike Adyen (whose webhooks always carry the same notification item
@@ -50,4 +50,27 @@ HANDLED_WEBHOOK_EVENTS = [
     "checkout.session.completed",
     "checkout.session.async_payment_succeeded",
     "checkout.session.async_payment_failed",
+]
+
+# Keys to mask (case-insensitively) before logging anything that might
+# contain them - see payments_core/logging_utils.py's mask_sensitive() for
+# how this list actually gets used. Covers Stripe's real credential
+# fields both ways they can show up: the short request-body key name
+# ("secret_key", from StripeConfigInputSerializer/STRIPE_CONFIG_FIELD_MAP
+# in payments_core/serializers.py) and the prefixed model field name
+# ("stripe_secret_key", from PaymentProviderStripeConfig in
+# payments_stripe/models.py) - plus "authorization", since
+# StripeAdapter._get_specific_processing_values/StripeReturnView send the
+# secret key as an `Authorization: Bearer <secret_key>` HEADER, not a body
+# field, so that header needs masking too if headers are ever logged.
+# Deliberately does NOT include "publishable_key"/"stripe_publishable_key"
+# - Stripe's publishable key is meant to be exposed (it's even sent to
+# the BROWSER in a real client-side integration), so masking it would
+# hide harmless information for no benefit.
+SENSITIVE_KEYS = [
+    "secret_key",
+    "stripe_secret_key",
+    "webhook_secret",
+    "stripe_webhook_secret",
+    "authorization",
 ]

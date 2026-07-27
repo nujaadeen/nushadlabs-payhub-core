@@ -1,8 +1,12 @@
+import logging
 from decimal import Decimal
 
 import requests
 
 from .exceptions import PaymentProviderRequestError
+from .logging_utils import mask_sensitive
+
+logger = logging.getLogger(__name__)
 
 # Currencies whose smallest unit IS the major unit - i.e. they have no
 # "cents". Stripe and Adyen both require amounts in a currency's smallest
@@ -54,7 +58,9 @@ def to_major_currency_units(minor_amount, currency):
     return Decimal(minor_amount) / (10 ** decimal_places)
 
 
-def send_provider_api_request(method, url, headers=None, data=None, json=None, timeout=30):
+def send_provider_api_request(
+    method, url, headers=None, data=None, json=None, timeout=30, sensitive_keys=None
+):
     """
     Mirrors Odoo's payment.provider._send_api_request().
 
@@ -73,7 +79,22 @@ def send_provider_api_request(method, url, headers=None, data=None, json=None, t
     That's the whole point of this helper existing: every adapter, and the
     view layer that calls them, only ever has to handle ONE exception type,
     no matter which provider or which kind of failure it was.
+
+    `sensitive_keys` - optional, provider-specific (see
+    payments_stripe/const.py / payments_adyen/const.py's SENSITIVE_KEYS,
+    and payments_core/logging_utils.py's mask_sensitive()). This function
+    itself is provider-AGNOSTIC (Stripe and Adyen both call it, so it has
+    no ONE sensitive-keys list of its own) - each caller passes its own
+    provider's list in, so the DEBUG-level request/response logging below
+    masks the right fields for whichever provider is actually calling.
+    Passing nothing here just means nothing gets masked, which is why
+    every real call site in this project DOES pass its provider's list.
     """
+    masked_headers = mask_sensitive(headers, sensitive_keys or [])
+    masked_body = mask_sensitive(data if data is not None else json, sensitive_keys or [])
+    logger.debug(
+        "Sending %s request to %s with headers=%s body=%s", method, url, masked_headers, masked_body
+    )
     try:
         response = requests.request(
             method, url, headers=headers, data=data, json=json, timeout=timeout
@@ -115,4 +136,13 @@ def send_provider_api_request(method, url, headers=None, data=None, json=None, t
                 detail = message or error_body.get("message") or detail
         raise PaymentProviderRequestError(detail) from exc
 
-    return response.json()
+    response_body = response.json()
+    # Mask before logging, not after - see mask_sensitive()'s docstring:
+    # this builds a NEW, masked dict and logs THAT, so the real
+    # response_body returned below (and stored, e.g. in
+    # PaymentTransaction.provider_data) is never touched by masking - only
+    # what reaches the log output is.
+    logger.debug(
+        "Received response from %s: %s", url, mask_sensitive(response_body, sensitive_keys or [])
+    )
+    return response_body

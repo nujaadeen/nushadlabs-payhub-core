@@ -1,10 +1,10 @@
 import hashlib
 import hmac
-import logging
 import time
 
 from payments_core.exceptions import PaymentProviderRequestError
 from payments_core.interfaces import PaymentProviderAdapter
+from payments_core.logging_utils import get_masked_logger, mask_sensitive
 from payments_core.utils import (
     send_provider_api_request,
     to_major_currency_units,
@@ -24,7 +24,14 @@ from . import const
 # same reason - this isn't a new pattern.
 from payments_core.models import PaymentTransaction
 
-logger = logging.getLogger(__name__)
+# get_masked_logger(name, sensitive_keys=...) instead of plain
+# logging.getLogger(__name__) - see payments_core/logging_utils.py. This
+# is still just a standard Python logger (nothing about HOW you call
+# logger.warning()/logger.info() below changes) - the only difference is
+# `logger.sensitive_keys` is now available as a convenience for any call
+# site here that wants to mask a payload before logging it, without a
+# separate `from . import const` lookup each time.
+logger = get_masked_logger(__name__, sensitive_keys=const.SENSITIVE_KEYS)
 
 # Stripe versions its whole API by date and expects that date sent as the
 # Stripe-Version header on every request (there's no version number in the
@@ -75,7 +82,7 @@ def get_feature_support_fields(provider):
     tokenization, and express checkout are not implemented for Stripe, so
     every key below stays "not_implemented".
 
-    # Phase 2/3 TODO: once send_capture_request / send_refund_request /
+    # Phase 2/3 TODO: once _send_capture_request / _send_refund_request /
     # tokenization / express checkout are actually implemented for Stripe,
     # flip the matching key here (e.g. support_refund = "full") - this
     # function is the one place that needs to change.
@@ -92,23 +99,23 @@ class StripeAdapter(PaymentProviderAdapter):
     @abstractmethod, so Python won't even let us instantiate this class
     unless every one of THOSE is overridden below - that's true even for
     the methods we're only stubbing out this phase. The one exception is
-    get_supported_currencies, which has a real default on the base class
+    _get_supported_currencies, which has a real default on the base class
     (see its comment in interfaces.py) - we override it below anyway,
     since Stripe's supported currencies differ from that "no restriction"
     default.
 
     Phase 2 implements the "online_redirect" flow only:
-    get_specific_processing_values() (creates a real Stripe Checkout
-    Session) and send_payment_request() (a thin wrapper around it). Every
+    _get_specific_processing_values() (creates a real Stripe Checkout
+    Session) and _send_payment_request() (a thin wrapper around it). Every
     other method below is still a stub - see its docstring for which phase
     implements it for real.
     """
 
-    def get_supported_currencies(self):
+    def _get_supported_currencies(self):
         """
         Mirrors Odoo's payment_stripe module overriding
         payment.provider._get_supported_currencies() - see
-        PaymentProviderAdapter.get_supported_currencies in
+        PaymentProviderAdapter._get_supported_currencies in
         payments_core/interfaces.py for the full explanation of why this
         override pattern exists (a hardcoded, per-adapter constant instead
         of a database field). The actual list of codes lives in
@@ -117,7 +124,7 @@ class StripeAdapter(PaymentProviderAdapter):
         """
         return const.SUPPORTED_CURRENCIES
 
-    def get_specific_processing_values(self, transaction):
+    def _get_specific_processing_values(self, transaction):
         """
         Mirrors Odoo's payment_stripe module's `_stripe_create_intent` /
         `_stripe_prepare_payment_intent_payload`, simplified down to
@@ -173,6 +180,12 @@ class StripeAdapter(PaymentProviderAdapter):
                 "Stripe-Version": STRIPE_API_VERSION,
             },
             data=payload,
+            # const.SENSITIVE_KEYS masks this "Authorization" header (and
+            # secret_key/webhook_secret, if either ever showed up in a
+            # body) before send_provider_api_request logs the request -
+            # see that function's own docstring, and const.SENSITIVE_KEYS'
+            # comment, for the full explanation.
+            sensitive_keys=const.SENSITIVE_KEYS,
         )
 
         return {
@@ -185,7 +198,7 @@ class StripeAdapter(PaymentProviderAdapter):
             "raw_response": response_content,
         }
 
-    def send_payment_request(self, transaction):
+    def _send_payment_request(self, transaction):
         """
         Mirrors Odoo's payment.transaction._send_payment_request().
 
@@ -198,21 +211,21 @@ class StripeAdapter(PaymentProviderAdapter):
         their job (a frontend, a mobile app, curl in the README) to send
         the end-customer's browser there.
         """
-        return self.get_specific_processing_values(transaction)
+        return self._get_specific_processing_values(transaction)
 
-    def send_capture_request(self, transaction):
+    def _send_capture_request(self, transaction):
         """Mirrors Odoo's _send_capture_request(). Implemented in Phase 3."""
-        raise NotImplementedError("send_capture_request is implemented in Phase 3")
+        raise NotImplementedError("_send_capture_request is implemented in Phase 3")
 
-    def send_void_request(self, transaction):
+    def _send_void_request(self, transaction):
         """Mirrors Odoo's _send_void_request(). Implemented in Phase 3."""
-        raise NotImplementedError("send_void_request is implemented in Phase 3")
+        raise NotImplementedError("_send_void_request is implemented in Phase 3")
 
-    def send_refund_request(self, transaction):
+    def _send_refund_request(self, transaction):
         """Mirrors Odoo's _send_refund_request(). Implemented in Phase 3."""
-        raise NotImplementedError("send_refund_request is implemented in Phase 3")
+        raise NotImplementedError("_send_refund_request is implemented in Phase 3")
 
-    def verify_webhook_signature(self, raw_body, signature_header, webhook_secret):
+    def _verify_webhook_signature(self, raw_body, signature_header, webhook_secret):
         """
         Mirrors Odoo's payment_stripe module's webhook signature check
         (Stripe's own standard algorithm, documented in Stripe's own
@@ -267,7 +280,7 @@ class StripeAdapter(PaymentProviderAdapter):
 
         return True
 
-    def search_by_reference(self, payment_data):
+    def _search_by_reference(self, payment_data):
         """
         Mirrors Odoo's payment_stripe module's `_search_by_reference`.
 
@@ -276,7 +289,7 @@ class StripeAdapter(PaymentProviderAdapter):
         StripeWebhookView / StripeReturnView in payments_core/views.py,
         which build it from Stripe's `client_reference_id` - the value we
         set when CREATING the Checkout Session in
-        get_specific_processing_values() above), rather than trying to
+        _get_specific_processing_values() above), rather than trying to
         derive it from a Stripe-specific id.
         """
         reference = payment_data.get("reference")
@@ -291,7 +304,7 @@ class StripeAdapter(PaymentProviderAdapter):
             logger.warning("Stripe: no transaction found matching reference '%s'.", reference)
         return tx
 
-    def apply_updates(self, transaction, payment_data):
+    def _apply_updates(self, transaction, payment_data):
         """
         Mirrors Odoo's payment.transaction._apply_updates() override in the
         payment_stripe module.
@@ -362,18 +375,18 @@ class StripeAdapter(PaymentProviderAdapter):
             return
 
         logger.warning(
-            "Stripe apply_updates called with neither a payment_intent nor a "
+            "Stripe _apply_updates called with neither a payment_intent nor a "
             "checkout_session for transaction %s",
             transaction.reference,
         )
 
-    def extract_amount_data(self, transaction, payment_data):
+    def _extract_amount_data(self, transaction, payment_data):
         """
         Mirrors Odoo's payment.transaction._extract_amount_data() override
         in payment_stripe.
 
         Pulls amount/currency out of whichever object we have (PaymentIntent
-        or Checkout Session - same payload duality as apply_updates above)
+        or Checkout Session - same payload duality as _apply_updates above)
         and converts from Stripe's minor units back to our major-unit
         Decimal representation via to_major_currency_units().
         """
@@ -394,6 +407,6 @@ class StripeAdapter(PaymentProviderAdapter):
             "currency": currency,
         }
 
-    def extract_token_values(self, transaction, payment_data):
+    def _extract_token_values(self, transaction, payment_data):
         """Mirrors Odoo's _extract_token_values(). Implemented in Phase 3."""
-        raise NotImplementedError("extract_token_values is implemented in Phase 3")
+        raise NotImplementedError("_extract_token_values is implemented in Phase 3")

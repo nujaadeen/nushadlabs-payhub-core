@@ -56,7 +56,7 @@ class AdyenConfigInputSerializer(serializers.Serializer):
     # available yet at provider-creation time). Payments will fail with a
     # clear error at POST /payments/ time if this is still missing when a
     # payment is actually attempted - see AdyenAdapter.
-    # get_specific_processing_values in payments_adyen/services.py.
+    # _get_specific_processing_values in payments_adyen/services.py.
     theme_id = serializers.CharField(required=False, allow_blank=True)
 
 

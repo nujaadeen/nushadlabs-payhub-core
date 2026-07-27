@@ -7,12 +7,14 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from payments_adyen.const import SENSITIVE_KEYS as ADYEN_SENSITIVE_KEYS
 from payments_adyen.services import (
     ADYEN_TEST_PAYMENTS_DETAILS_URL,
     AdyenAdapter,
     adyen_event_to_result_code,
 )
 from payments_stripe.const import HANDLED_WEBHOOK_EVENTS as STRIPE_HANDLED_WEBHOOK_EVENTS
+from payments_stripe.const import SENSITIVE_KEYS as STRIPE_SENSITIVE_KEYS
 from payments_stripe.services import (
     STRIPE_API_VERSION,
     STRIPE_CHECKOUT_SESSIONS_URL,
@@ -21,6 +23,7 @@ from payments_stripe.services import (
 from tenants.models import Customer
 
 from .exceptions import PaymentProviderRequestError
+from .logging_utils import mask_sensitive
 from .models import PaymentProvider, PaymentTransaction, get_adapter_for_provider_code
 from .serializers import (
     PaymentProviderCreateSerializer,
@@ -90,7 +93,7 @@ class ProviderListCreateView(APIView):
             # on PaymentProvider - it's a hardcoded constant living in each
             # adapter's own code (see payments_stripe/const.py,
             # payments_adyen/const.py), read via
-            # adapter.get_supported_currencies() - exactly mirroring Odoo's
+            # adapter._get_supported_currencies() - exactly mirroring Odoo's
             # payment.provider._get_supported_currencies(), which is a
             # method individual provider modules override, not something a
             # merchant configures per record. That means we CAN'T filter
@@ -109,10 +112,10 @@ class ProviderListCreateView(APIView):
             matching_providers = []
             for provider in providers:
                 adapter = get_adapter_for_provider_code(provider.code)
-                supported_currencies = adapter.get_supported_currencies()
+                supported_currencies = adapter._get_supported_currencies()
                 if supported_currencies is None:
                     # None means "no restriction" (see
-                    # PaymentProviderAdapter.get_supported_currencies in
+                    # PaymentProviderAdapter._get_supported_currencies in
                     # interfaces.py) - include this provider regardless of
                     # which currency was requested.
                     matching_providers.append(provider)
@@ -300,7 +303,7 @@ class PaymentListCreateView(APIView):
             )
 
         # TODO: consider validating currency compatibility at POST
-        # /payments/ time too (against provider.get_supported_currencies()
+        # /payments/ time too (against provider._get_supported_currencies()
         # - see ProviderListCreateView.get's currency filter, which uses
         # the same adapter method). Not implemented here yet: a real
         # frontend would only ever show a customer providers that already
@@ -310,10 +313,6 @@ class PaymentListCreateView(APIView):
 
         customer = get_object_or_404(
             Customer, pk=data["customer_id"], tenant_id=data["tenant_id"]
-        )
-
-        reference = PaymentTransaction._compute_reference(
-            provider_code=provider.code, tenant_id=data["tenant_id"]
         )
 
         # Step 1: create the draft row and let it COMMIT before we make any
@@ -328,16 +327,71 @@ class PaymentListCreateView(APIView):
         # would be pure downside with no upside - so instead we commit the
         # draft row first, make the external call as a separate step, then
         # do a second, separate save with whatever the call returned.
-        txn = PaymentTransaction.objects.create(
-            tenant_id=data["tenant_id"],
-            provider=provider,
-            customer=customer,
-            reference=reference,
-            currency=data["currency"].upper(),
-            amount=data["amount"],
-            operation="online_redirect",
-            return_url=data["return_url"],
-        )
+        #
+        # Reference collision guard: _compute_reference() (below) READS
+        # this tenant's existing references and computes the next unused
+        # suffix in plain Python, then create() (also below) is a SEPARATE
+        # database call afterward - a small race window exists between
+        # those two steps. If two requests for the SAME tenant hit that
+        # window at almost the same instant, both could compute the SAME
+        # suffix (each sees "no collision yet" before either has actually
+        # inserted anything), and then both try to create() a transaction
+        # with that same reference. Rather than closing this window with
+        # heavier locking (e.g. select_for_update() to lock the existing
+        # rows while we compute), we mirror Odoo's own approach: Odoo
+        # relies on its database's unique constraint as the ACTUAL source
+        # of truth here, not on preventing the race in application code at
+        # all - the (tenant, reference) unique_together constraint (see
+        # PaymentTransaction.Meta) is what guarantees a duplicate reference
+        # can never actually be COMMITTED, no matter what raced in Python
+        # beforehand. When Postgres enforces that constraint and rejects
+        # the second insert, Django raises IntegrityError - we catch that
+        # and retry the whole compute-then-create step ONCE more (a fresh
+        # _compute_reference() call will now see the other request's
+        # already-committed row and pick a different suffix). This is a
+        # lightweight, good-enough answer for how rarely two requests for
+        # the same tenant would land in this exact window - not a
+        # high-enough-frequency hot path here to justify select_for_update()
+        # or similar. `_create_transaction()` just below is a small nested
+        # function (a "closure" - it reads `provider`/`data`/`customer`
+        # from this method's own local variables without needing them
+        # passed in as arguments) purely so this compute+create pair can
+        # be called twice below without copy-pasting it.
+        def _create_transaction():
+            reference = PaymentTransaction._compute_reference(
+                provider_code=provider.code, tenant_id=data["tenant_id"]
+            )
+            return PaymentTransaction.objects.create(
+                tenant_id=data["tenant_id"],
+                provider=provider,
+                customer=customer,
+                reference=reference,
+                currency=data["currency"].upper(),
+                amount=data["amount"],
+                operation="online_redirect",
+                return_url=data["return_url"],
+            )
+
+        try:
+            txn = _create_transaction()
+        except IntegrityError:
+            try:
+                txn = _create_transaction()
+            except IntegrityError:
+                # Lost the retry too - vanishingly unlikely (this would
+                # need a THIRD colliding request to land in the same tiny
+                # window), but we still need a clean response rather than
+                # letting a second IntegrityError propagate into a raw 500.
+                # 409 Conflict is the correct HTTP status for "the request
+                # is valid, but conflicts with the current state of the
+                # server" - exactly this situation.
+                return Response(
+                    {
+                        "reference": "Could not generate a unique payment reference "
+                        "after retrying - please try again."
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
 
         # Step 2: the external call - NOT inside a database transaction.
         try:
@@ -374,15 +428,16 @@ class PaymentListCreateView(APIView):
             # until a Phase 3 webhook tells us otherwise).
             txn._set_pending()
         # else: this is Adyen's immediate-processing case (see
-        # AdyenAdapter.get_specific_processing_values in
+        # AdyenAdapter._get_specific_processing_values in
         # payments_adyen/services.py) - the adapter has ALREADY called
         # transaction._apply_updates() and moved this transaction to its
         # real final state (e.g. "done" or "error") before returning here.
-        # Calling _set_pending() now would be wrong - and would actually
-        # raise ValueError, since "done"/"error" aren't in _set_pending's
-        # allowed source states (see _update_state) - so we skip it
-        # entirely and just report back whatever state the transaction is
-        # already in.
+        # Calling _set_pending() now would be wrong - since "done"/"error"
+        # aren't in _set_pending's allowed source states (see
+        # _update_state), it would be refused (logged, not raised - see
+        # _update_state's own docstring) and leave the transaction
+        # untouched anyway - so we skip it entirely and just report back
+        # whatever state the transaction is already in.
 
         return Response(
             {
@@ -458,6 +513,7 @@ class StripeReturnView(APIView):
                     "Authorization": f"Bearer {config.stripe_secret_key}",
                     "Stripe-Version": STRIPE_API_VERSION,
                 },
+                sensitive_keys=STRIPE_SENSITIVE_KEYS,
             )
         except PaymentProviderRequestError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
@@ -475,10 +531,15 @@ class StripeWebhookView(APIView):
     Handles POST /webhooks/stripe/ - mirrors Odoo's Stripe webhook
     controller.
 
-    # TODO: Phase 5 - guard against duplicate webhook delivery
-    # re-processing the same event (Stripe retries webhooks that don't get
-    # a fast 2xx response, and can also just send the same event twice -
-    # see Stripe's own docs on webhook idempotency).
+    # Idempotency: Stripe retries webhooks that don't get a fast 2xx
+    # response, and can also just send the same event twice regardless of
+    # timing (see Stripe's own docs on webhook idempotency) - duplicate
+    # deliveries are safely ignored by PaymentTransaction._update_state's
+    # already-in-target-state check (see that method's own docstring in
+    # payments_core/models.py for the full explanation), not by anything
+    # in this view. A second delivery for an already-"done" transaction
+    # just gets logged as skipped when _process() -> _apply_updates() ->
+    # a _set_* call reaches that check, not reprocessed or errored.
 
     Design note on the URL - this used to be
     /webhooks/stripe/<uuid:provider_id>/, with provider_id embedded in the
@@ -488,7 +549,7 @@ class StripeWebhookView(APIView):
     identifier in it at all: /payment/stripe/webhook) and turned out to be
     unnecessary: the webhook payload itself already carries our own
     transaction reference (`client_reference_id`, set when we created the
-    Checkout Session - see StripeAdapter.get_specific_processing_values),
+    Checkout Session - see StripeAdapter._get_specific_processing_values),
     and PaymentTransaction._search_by_reference can already find the
     matching transaction from that alone. Once we have the transaction, its
     `provider` foreign key gets us the right provider - and its
@@ -558,6 +619,16 @@ class StripeWebhookView(APIView):
             "reference": checkout_session.get("client_reference_id"),
             "checkout_session": checkout_session,
         }
+        # Mask before logging, not after: this Checkout Session object is
+        # Stripe's own data about the payment (never our stored
+        # credentials - Stripe has no reason to echo secret_key/
+        # webhook_secret back to us), but masking it defensively here
+        # costs nothing and matches STRIPE_SENSITIVE_KEYS being applied
+        # consistently everywhere Stripe data gets logged in this project,
+        # not just where a leak is currently plausible.
+        logger.debug(
+            "Stripe webhook payload: %s", mask_sensitive(checkout_session, STRIPE_SENSITIVE_KEYS)
+        )
 
         # Find the transaction FIRST, using only the reference embedded in
         # the payload - this is now the ONLY way we identify which tenant/
@@ -589,7 +660,7 @@ class StripeWebhookView(APIView):
 
         adapter = StripeAdapter()
         try:
-            adapter.verify_webhook_signature(
+            adapter._verify_webhook_signature(
                 raw_body, signature_header, tx.provider.stripe_config.stripe_webhook_secret
             )
         except PaymentProviderRequestError as exc:
@@ -638,6 +709,7 @@ def _complete_adyen_payments_details(reference, details):
             ADYEN_TEST_PAYMENTS_DETAILS_URL,
             headers={"X-API-Key": config.adyen_api_key, "Content-Type": "application/json"},
             json={"details": details},
+            sensitive_keys=ADYEN_SENSITIVE_KEYS,
         )
     except PaymentProviderRequestError as exc:
         return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
@@ -655,7 +727,7 @@ class AdyenPaymentsDetailsView(APIView):
 
     This is the "continuation" call for Adyen payment methods that need an
     extra round-trip after the initial /payments call - typically 3D
-    Secure (see AdyenAdapter.get_specific_processing_values in
+    Secure (see AdyenAdapter._get_specific_processing_values in
     payments_adyen/services.py, which returns a `redirect_url` for exactly
     this case). A real frontend integration would collect whatever
     "details" Adyen's own client-side SDK produces after the shopper
@@ -710,8 +782,13 @@ class AdyenWebhookView(APIView):
     Handles POST /webhooks/adyen/ - mirrors Odoo's `adyen_webhook`
     controller.
 
-    # TODO: Phase 5 - guard against duplicate webhook delivery
-    # re-processing the same event.
+    # Idempotency: duplicate notification deliveries (Adyen re-sends a
+    # notification if it doesn't get "[accepted]" back fast enough) are
+    # safely ignored by PaymentTransaction._update_state's already-in-
+    # target-state check - see StripeWebhookView's matching comment above,
+    # and _update_state's own docstring in payments_core/models.py, for
+    # the full explanation. Not something this view has to guard against
+    # itself.
 
     Design note on the URL - this used to be
     /webhooks/adyen/<uuid:provider_id>/, with provider_id in the path so we
@@ -750,9 +827,21 @@ class AdyenWebhookView(APIView):
 
         for item_wrapper in request.data.get("notificationItems", []):
             item = item_wrapper.get("NotificationRequestItem", {})
+            # Mask before logging, not after - see StripeWebhookView's
+            # matching comment above for why this is applied defensively
+            # even though Adyen's own notification fields (pspReference,
+            # merchantReference, additionalData.hmacSignature, ...) aren't
+            # our stored credentials either. Note additionalData.hmacSignature
+            # is a nested field, so this top-level-only mask_sensitive()
+            # call does NOT mask it (see mask_sensitive's own "shallow"
+            # docstring note) - that's fine, it's a per-notification
+            # SIGNATURE Adyen computed, not the shared secret
+            # (adyen_hmac_key) that produced it, so it isn't itself
+            # something ADYEN_SENSITIVE_KEYS needs to hide.
+            logger.debug("Adyen webhook notification item: %s", mask_sensitive(item, ADYEN_SENSITIVE_KEYS))
 
             # Find the transaction for THIS item first, using its own
-            # eventCode/merchantReference (AdyenAdapter.search_by_reference
+            # eventCode/merchantReference (AdyenAdapter._search_by_reference
             # already knows how to read these - unchanged from before this
             # fix, see payments_adyen/services.py). This is what tells us
             # which provider - and which adyen_hmac_key - to verify this
@@ -760,7 +849,7 @@ class AdyenWebhookView(APIView):
             # URL.
             tx = PaymentTransaction._search_by_reference("adyen", item)
             if tx is None:
-                # search_by_reference already logs WHY (an event code we
+                # _search_by_reference already logs WHY (an event code we
                 # don't look up yet, or no matching reference) - nothing
                 # more to log here. Skip just this ONE item and keep
                 # processing the rest of the batch, mirroring Odoo's own
@@ -772,7 +861,7 @@ class AdyenWebhookView(APIView):
             hmac_key = tx.provider.adyen_config.adyen_hmac_key
 
             try:
-                adapter.verify_webhook_signature(item, hmac_key)
+                adapter._verify_webhook_signature(item, hmac_key)
             except PaymentProviderRequestError:
                 logger.warning(
                     "Adyen webhook: signature verification failed for a "

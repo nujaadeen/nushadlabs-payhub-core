@@ -8,6 +8,7 @@ from django.utils import timezone
 from tenants.models import Customer, Tenant
 
 from .exceptions import PaymentProviderRequestError
+from .logging_utils import mask_sensitive
 
 logger = logging.getLogger(__name__)
 
@@ -445,7 +446,7 @@ class PaymentTransaction(models.Model):
         - this project picks the right adapter without Odoo's `_inherit`
         mechanism.
         """
-        return self._get_adapter().get_specific_processing_values(self)
+        return self._get_adapter()._get_specific_processing_values(self)
 
     @classmethod
     def _process(cls, provider_code, payment_data):
@@ -477,11 +478,24 @@ class PaymentTransaction(models.Model):
         """
         tx = cls._search_by_reference(provider_code, payment_data)
         if tx is None:
+            # Lazy imports (same reason as get_adapter_for_provider_code's
+            # own lazy imports near the top of this file - avoids a
+            # circular import with payments_stripe/payments_adyen at
+            # module load time) - just to look up the right provider's
+            # SENSITIVE_KEYS so payment_data can be masked before logging
+            # it, not after (see payments_core/logging_utils.py's
+            # mask_sensitive()).
+            if provider_code == "stripe":
+                from payments_stripe.const import SENSITIVE_KEYS as sensitive_keys
+            elif provider_code == "adyen":
+                from payments_adyen.const import SENSITIVE_KEYS as sensitive_keys
+            else:
+                sensitive_keys = []
             logger.warning(
                 "PaymentTransaction._process: no transaction found for "
                 "provider_code=%s, payment_data=%s",
                 provider_code,
-                payment_data,
+                mask_sensitive(payment_data, sensitive_keys),
             )
             return None
 
@@ -502,7 +516,32 @@ class PaymentTransaction(models.Model):
         # final save is what actually flushes whatever DID change, however
         # many or few fields that turned out to be.
         tx.save()
+        tx._post_process()
         return tx
+
+    def _post_process(self):
+        """
+        Post-process the transaction. Mirrors Odoo's
+        payment.transaction._post_process().
+
+        Odoo's REAL _post_process() also runs provider/module-specific
+        finalization here (e.g. confirming a sale order, sending a receipt
+        email) via a chain of per-module overrides - we have no such
+        business logic to hook in yet, so the generic behavior here only
+        flags the transaction as post-processed. Kept as an explicit hook
+        (rather than folding this single line into _process() directly)
+        so a future phase implementing e.g. tokenization side effects has
+        an obvious, correctly-named place to override/extend, exactly like
+        Odoo's own module-specific overrides of this same method.
+
+        # TODO: consider a periodic reconciliation job for transactions
+        # stuck "pending" without ever reaching this method (e.g. a
+        # webhook that never arrived), mirroring Odoo's own
+        # _cron_post_process. Out of scope for this phase - no Celery/cron
+        # infrastructure exists in this project yet (see README).
+        """
+        self.is_post_processed = True
+        self.save(update_fields=["is_post_processed"])
 
     @classmethod
     def _search_by_reference(cls, provider_code, payment_data):
@@ -515,8 +554,8 @@ class PaymentTransaction(models.Model):
         classmethod: there's no transaction instance yet to read a provider
         code off of - finding one IS the whole point of this method). Each
         adapter knows where in ITS OWN payload shape the reference actually
-        lives (see StripeAdapter.search_by_reference /
-        AdyenAdapter.search_by_reference).
+        lives (see StripeAdapter._search_by_reference /
+        AdyenAdapter._search_by_reference).
         """
         try:
             adapter = get_adapter_for_provider_code(provider_code)
@@ -527,7 +566,7 @@ class PaymentTransaction(models.Model):
             )
             return None
 
-        return adapter.search_by_reference(payment_data)
+        return adapter._search_by_reference(payment_data)
 
     def _apply_updates(self, payment_data):
         """
@@ -541,12 +580,12 @@ class PaymentTransaction(models.Model):
 
         Called from three different places, all funneling through
         _process() above: Adyen's synchronous /payments response (when it
-        completes immediately - see AdyenAdapter.get_specific_processing_values),
+        completes immediately - see AdyenAdapter._get_specific_processing_values),
         and - as of this phase - both providers' webhooks and Stripe's/
         Adyen's return-URL flows (see payments_core/views.py). This method
         itself doesn't need to know or care which of those triggered it.
         """
-        self._get_adapter().apply_updates(self, payment_data)
+        self._get_adapter()._apply_updates(self, payment_data)
 
     def _validate_amount(self, payment_data):
         """
@@ -591,7 +630,7 @@ class PaymentTransaction(models.Model):
         major-unit Decimal representation (see to_major_currency_units in
         payments_core/utils.py).
         """
-        return self._get_adapter().extract_amount_data(self, payment_data)
+        return self._get_adapter()._extract_amount_data(self, payment_data)
 
     def _tokenize(self, payment_data):
         """
@@ -622,18 +661,71 @@ class PaymentTransaction(models.Model):
         "not" (which get skipped, with a logged warning) - because a single
         Odoo call can be asked to update many transactions together. We only
         ever operate on one transaction instance at a time in this project,
-        so this is the same guard logic simplified down to a single record:
-        if `self.state` isn't one of the allowed source states for this
-        transition, we refuse it outright (raise) instead of silently
-        skipping it - there's no batch of "other records" to fall back to
-        updating, so silently doing nothing would just hide a bug.
+        so this is the same guard logic simplified down to a single record.
+
+        THIS METHOD IS ALSO THIS PROJECT'S WHOLE WEBHOOK IDEMPOTENCY
+        MECHANISM (see the README's "Idempotency & Hardening" section for
+        the full picture). There is deliberately NO separate "have I
+        already processed this event?" table anywhere in this project -
+        Odoo doesn't have one either. Idempotency instead falls directly
+        out of the state machine below: if a SECOND webhook delivery for
+        an already-"done" transaction arrives and calls e.g. _set_done()
+        again, the first guard below sees `self.state == target_state`
+        already, logs it, and returns without touching the row again - so
+        replaying the same webhook twice is naturally safe, without any
+        extra deduplication machinery having to exist for it.
+
+        Two guards, checked in this order (matches Odoo's own
+        classification exactly):
+
+        1. Already in the target state - the idempotency case above.
+           Logged at INFO, not WARNING/ERROR: this is normal, expected
+           traffic (Stripe retries webhooks that don't get a fast enough
+           2xx response, and can just send the same event twice regardless
+           of timing), not a sign anything went wrong.
+        2. Not in ANY allowed source state for this transition - a
+           genuinely unexpected transition (e.g. trying to move an already
+           "cancel"ed transaction to "done"). Logged at WARNING, since
+           it's more surprising than case 1, but STILL returns rather than
+           raising.
+
+        Returning instead of raising in EITHER guard case above is a
+        deliberate departure from an earlier version of this method (which
+        used to `raise ValueError` for case 2) - matching Odoo's own
+        _update_state, which never raises here either. The reasoning: a
+        webhook or return-URL caller has no useful way to "fix" an
+        unexpected transition and retry - raising would just turn a
+        harmless no-op into an unhandled exception. In practice this
+        project's webhook views already had a broad `except Exception`
+        around _process() that would have swallowed that exception anyway
+        (see StripeWebhookView/AdyenWebhookView in payments_core/views.py)
+        - so this change trades an opaque full stack trace (logged as an
+        ERROR for something that isn't actually an error) for a short,
+        clear, correctly-leveled log line instead.
+
+        Returns `self` in every case - whether the transition happened or
+        was skipped/refused - so callers can treat the return value
+        uniformly either way (mirrors Odoo's _update_state, which also
+        always returns the recordset it was called on).
         """
-        if self.state not in allowed_states:
-            raise ValueError(
-                f"Cannot move transaction {self.reference} from state "
-                f"'{self.state}' to '{target_state}' - allowed source "
-                f"states for this transition are {allowed_states}."
+        if self.state == target_state:
+            logger.info(
+                "Skipped the update of transaction %s as it is already in state %s.",
+                self.reference,
+                self.state,
             )
+            return self
+
+        if self.state not in allowed_states:
+            logger.warning(
+                "Refused to update transaction %s from state %s to state %s; allowed source "
+                "states are: %s.",
+                self.reference,
+                self.state,
+                target_state,
+                allowed_states,
+            )
+            return self
 
         self.state = target_state
         self.state_message = state_message
@@ -644,7 +736,28 @@ class PaymentTransaction(models.Model):
         # RuntimeWarning and can compare incorrectly against aware datetimes
         # elsewhere.
         self.last_state_change = timezone.now()
-        self.save(update_fields=["state", "state_message", "last_state_change", "updated_at"])
+        # Reset here (a genuine state TRANSITION only - the two early
+        # returns above never reach this line) - mirrors Odoo's own
+        # _update_state, which resets is_post_processed back to False on
+        # every actual transition. Why: _post_process() (called at the end
+        # of PaymentTransaction._process() below) is meant to run again any
+        # time a transaction genuinely CHANGES state - e.g. a transaction
+        # that reached "done", then later gets flagged "error" by a
+        # delayed amount-mismatch check (_validate_amount), needs its
+        # post-processing hook to fire again for the NEW state, rather than
+        # staying marked "already post-processed" from the first time
+        # through.
+        self.is_post_processed = False
+        self.save(
+            update_fields=[
+                "state",
+                "state_message",
+                "last_state_change",
+                "is_post_processed",
+                "updated_at",
+            ]
+        )
+        return self
 
     def _set_pending(self, state_message=None):
         """
@@ -669,7 +782,7 @@ class PaymentTransaction(models.Model):
         but the money hasn't actually moved yet - that only happens on a
         manual capture (payment.provider.capture_manually /
         PaymentProvider.capture_manually). We don't implement sending a
-        capture request yet (see StripeAdapter/AdyenAdapter.send_capture_request,
+        capture request yet (see StripeAdapter/AdyenAdapter._send_capture_request,
         still Phase 3+ stubs), so nothing in THIS project currently drives a
         transaction to "authorized" - but the state has to exist and be
         reachable now so the state machine's shape is already correct for
@@ -696,7 +809,7 @@ class PaymentTransaction(models.Model):
         correct.
 
         'draft' stays in the allowed states too because of Adyen's
-        immediate-response case (see AdyenAdapter.get_specific_processing_values
+        immediate-response case (see AdyenAdapter._get_specific_processing_values
         in payments_adyen/services.py) - the one case in this project where
         a transaction reaches "done" WITHOUT ever passing through "pending"
         first.

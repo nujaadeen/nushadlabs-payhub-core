@@ -1,5 +1,20 @@
 from abc import ABC, abstractmethod
 
+# Naming convention: every method on this interface (and its Stripe/Adyen
+# implementations) is prefixed with a leading underscore, matching Odoo's
+# actual method names on payment.provider / payment.transaction exactly
+# (e.g. Odoo's real method is `_get_specific_processing_values`, not
+# `get_specific_processing_values`). In Odoo's own framework, this
+# underscore is a documented convention marking a method as "not meant to
+# be called from outside the model" (roughly: internal API, not part of
+# the public ORM-exposed surface) - but Python has no enforced privacy the
+# way some languages do, and Odoo's own convention isn't mechanically
+# enforced either; it's a naming signal, not a real access restriction.
+# We follow the SAME leading underscore here purely for naming fidelity
+# with Odoo - so a reader who already knows Odoo's payment framework can
+# match a method here to its Odoo equivalent by name alone - not because
+# Python is stopping anyone from calling these from outside the adapter.
+#
 # An ABC (Abstract Base Class) is Python's way of declaring "here is a
 # contract that subclasses MUST fulfil". You can't instantiate an ABC
 # directly, and if a subclass forgets to implement one of the methods marked
@@ -28,42 +43,42 @@ class PaymentProviderAdapter(ABC):
     """
 
     @abstractmethod
-    def send_payment_request(self, transaction):
+    def _send_payment_request(self, transaction):
         """Mirrors Odoo's payment.transaction._send_payment_request()."""
         raise NotImplementedError(
-            "send_payment_request is implemented per-adapter in Phase 2"
+            "_send_payment_request is implemented per-adapter in Phase 2"
         )
 
     @abstractmethod
-    def send_capture_request(self, transaction):
+    def _send_capture_request(self, transaction):
         """Mirrors Odoo's payment.transaction._send_capture_request()."""
         raise NotImplementedError(
-            "send_capture_request is implemented per-adapter in Phase 2"
+            "_send_capture_request is implemented per-adapter in Phase 2"
         )
 
     @abstractmethod
-    def send_void_request(self, transaction):
+    def _send_void_request(self, transaction):
         """Mirrors Odoo's payment.transaction._send_void_request()."""
         raise NotImplementedError(
-            "send_void_request is implemented per-adapter in Phase 2"
+            "_send_void_request is implemented per-adapter in Phase 2"
         )
 
     @abstractmethod
-    def send_refund_request(self, transaction):
+    def _send_refund_request(self, transaction):
         """Mirrors Odoo's payment.transaction._send_refund_request()."""
         raise NotImplementedError(
-            "send_refund_request is implemented per-adapter in Phase 2"
+            "_send_refund_request is implemented per-adapter in Phase 2"
         )
 
     @abstractmethod
-    def get_specific_processing_values(self, transaction):
+    def _get_specific_processing_values(self, transaction):
         """Mirrors Odoo's payment.transaction._get_specific_processing_values()."""
         raise NotImplementedError(
-            "get_specific_processing_values is implemented per-adapter in Phase 2"
+            "_get_specific_processing_values is implemented per-adapter in Phase 2"
         )
 
     @abstractmethod
-    def verify_webhook_signature(self, *args, **kwargs):
+    def _verify_webhook_signature(self, *args, **kwargs):
         """
         Verifies an incoming webhook actually came from the provider, not
         an attacker who just knows our webhook URL.
@@ -73,52 +88,68 @@ class PaymentProviderAdapter(ABC):
         their webhooks in fundamentally different ways: Stripe computes ONE
         HMAC over the whole raw request body, so its version takes
         (raw_body, signature_header, webhook_secret) - see
-        StripeAdapter.verify_webhook_signature in payments_stripe/services.py.
+        StripeAdapter._verify_webhook_signature in payments_stripe/services.py.
         Adyen signs EACH notification item individually using specific
         fields out of that item, so its version takes
         (notification_item, hmac_key) instead - see
-        AdyenAdapter.verify_webhook_signature in payments_adyen/services.py.
+        AdyenAdapter._verify_webhook_signature in payments_adyen/services.py.
         This method is declared with `*args, **kwargs` here (rather than a
         made-up shared signature that wouldn't actually match either
         implementation) specifically to acknowledge that difference - the
         real contract is just "every adapter must expose a method with this
         name that raises PaymentProviderRequestError on a bad signature",
         not "with these exact parameters".
+
+        Structural note on WHERE this lives, for fidelity-checking against
+        Odoo: in Odoo itself, signature verification is NOT a method on
+        payment.provider or payment.transaction at all - Stripe's
+        `_verify_signature` lives on the payment_stripe HTTP controller,
+        and Adyen's `_compute_signature` is a `@staticmethod` on the
+        payment_adyen controller too. Odoo keeps this in the web/controller
+        layer because verifying a webhook is fundamentally about trusting
+        an incoming HTTP request, not about the transaction/provider model
+        itself. This project puts it on the ADAPTER instead (called from
+        StripeWebhookView/AdyenWebhookView in payments_core/views.py) - a
+        deliberate, reasonable structural difference: our adapters already
+        own every other piece of provider-specific HTTP/crypto logic (the
+        API calls themselves), so keeping signature verification alongside
+        that, rather than splitting it out to the view layer the way Odoo
+        does, keeps all of one provider's protocol-level code in one place.
         """
         raise NotImplementedError(
-            "verify_webhook_signature is implemented per-adapter in Phase 3"
+            "_verify_webhook_signature is implemented per-adapter in Phase 3"
         )
 
     @abstractmethod
-    def search_by_reference(self, payment_data):
+    def _search_by_reference(self, payment_data):
         """Mirrors Odoo's payment.transaction._search_by_reference(). Implemented in Phase 3."""
         raise NotImplementedError(
-            "search_by_reference is implemented per-adapter in Phase 3"
+            "_search_by_reference is implemented per-adapter in Phase 3"
         )
 
     @abstractmethod
-    def apply_updates(self, transaction, payment_data):
+    def _apply_updates(self, transaction, payment_data):
         """Mirrors Odoo's payment.transaction._apply_updates(). Implemented in Phase 3."""
         raise NotImplementedError(
-            "apply_updates is implemented per-adapter in Phase 3"
+            "_apply_updates is implemented per-adapter in Phase 3"
         )
 
     @abstractmethod
-    def extract_amount_data(self, transaction, payment_data):
+    def _extract_amount_data(self, transaction, payment_data):
         """Mirrors Odoo's payment.transaction._extract_amount_data(). Implemented in Phase 3."""
         raise NotImplementedError(
-            "extract_amount_data is implemented per-adapter in Phase 3"
+            "_extract_amount_data is implemented per-adapter in Phase 3"
         )
 
     @abstractmethod
-    def extract_token_values(self, transaction, payment_data):
+    def _extract_token_values(self, transaction, payment_data):
         """Mirrors Odoo's payment.transaction._extract_token_values(). Implemented in Phase 3."""
         raise NotImplementedError(
-            "extract_token_values is implemented per-adapter in Phase 3"
+            "_extract_token_values is implemented per-adapter in Phase 3"
         )
 
     # ------------------------------------------------------------------
-    # get_supported_currencies is deliberately NOT decorated with
+    # _get_supported_currencies is deliberately NOT decorated with
     # @abstractmethod, unlike every method above. Every other method here
     # represents something an adapter MUST actively implement to do
     # anything useful (there's no sensible default for "how do I send a
@@ -129,10 +160,10 @@ class PaymentProviderAdapter(ABC):
     # when they need to restrict that. We mirror the same shape: this
     # concrete method IS that base/default behavior, inherited as-is by any
     # adapter that doesn't need to restrict its currencies, and overridden
-    # by ones that do (see StripeAdapter.get_supported_currencies /
-    # AdyenAdapter.get_supported_currencies for real overrides).
+    # by ones that do (see StripeAdapter._get_supported_currencies /
+    # AdyenAdapter._get_supported_currencies for real overrides).
     # ------------------------------------------------------------------
-    def get_supported_currencies(self):
+    def _get_supported_currencies(self):
         """
         Return the list of ISO 4217 currency codes this adapter supports.
 
