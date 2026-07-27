@@ -610,10 +610,14 @@ class PaymentTransaction(models.Model):
             return
 
         if extracted_amount != self.amount or extracted_currency != self.currency:
-            # _set_error can be called from "authorized"/"done" specifically
-            # BECAUSE of this case - see _set_error's docstring below for
-            # why those two states had to be added to its allowed source
-            # states in this phase.
+            # This call to _set_error can happen while self.state is
+            # already "done" (see the "authorized"/"done" check above) -
+            # see _set_error's own docstring below for why "done" is
+            # deliberately NOT in its allowed source states (matching
+            # Odoo exactly), and what that means for THIS specific case:
+            # the mismatch gets logged as a refused transition, not
+            # silently ignored, but the transaction stays "done" rather
+            # than moving to "error".
             self._set_error(
                 f"Amount or currency mismatch: expected {self.amount} {self.currency}, "
                 f"provider reported {extracted_amount} {extracted_currency}."
@@ -797,16 +801,27 @@ class PaymentTransaction(models.Model):
         """
         Mirrors Odoo's payment.transaction._set_done().
 
-        Allowed source states: 'draft', 'pending', 'authorized' - matches
-        Odoo (which also allows 'error', for a transaction that failed and
-        was later corrected; we don't have a path that re-drives an
-        'error' transaction back to 'done' in this project, so we leave
-        that one out). 'authorized' had to be added in this phase: once
-        _set_authorized (above) makes "authorized" reachable, a manual
-        capture completing would move a transaction from "authorized"
-        straight to "done" - we don't implement sending capture requests
-        yet either, but again, the state machine's SHAPE should already be
-        correct.
+        Allowed source states: 'draft', 'pending', 'authorized', 'error' -
+        matches Odoo's actual payment_transaction.py exactly (verified
+        directly against Odoo's source, not assumed). 'authorized' is here
+        because once _set_authorized (above) makes "authorized" reachable,
+        a manual capture completing would move a transaction from
+        "authorized" straight to "done" - we don't implement sending
+        capture requests yet either, but the state machine's SHAPE should
+        already be correct.
+
+        'error' is the one that was MISSING here before this fix - a real
+        bug, not a stylistic gap: without it, a transaction that picked up
+        a transient/spurious "error" from one notification could never
+        reach "done" afterward, even if a LATER notification confirmed the
+        payment actually succeeded. This is a normal, expected flow, not an
+        edge case - e.g. Adyen's hosted checkout page lets a shopper whose
+        card gets refused immediately retry with a different card, all
+        within the same session/reference; the first refusal can drive
+        this transaction to "error" (see _set_error below) before the
+        retry's later webhook confirms success and needs to move it on to
+        "done". This isn't a special case we invented - Odoo's own
+        _set_done allows exactly this recovery-from-error transition.
 
         'draft' stays in the allowed states too because of Adyen's
         immediate-response case (see AdyenAdapter._get_specific_processing_values
@@ -815,7 +830,7 @@ class PaymentTransaction(models.Model):
         first.
         """
         self._update_state(
-            allowed_states=("draft", "pending", "authorized"),
+            allowed_states=("draft", "pending", "authorized", "error"),
             target_state="done",
             state_message=state_message,
         )
@@ -839,21 +854,34 @@ class PaymentTransaction(models.Model):
         """
         Mirrors Odoo's payment.transaction._set_error().
 
-        Allowed source states: 'draft', 'pending', 'authorized', 'done'.
-        Phase 2 only ever called this right after a failed adapter call (so
-        only 'draft'/'pending' were reachable then). This phase adds
-        'authorized' and 'done' too, specifically because of
-        _validate_amount above: if a provider reports a DIFFERENT amount
-        than we expected, we need to be able to flag that as an error even
-        AFTER the transaction has already reached "authorized" or "done" -
-        an amount mismatch on an already-"done" transaction is exactly the
-        kind of thing 'error' needs to be reachable from, since it might
-        indicate the notification was tampered with. We still don't allow
-        'cancel' -> 'error' or 'error' -> 'error', since nothing in this
-        project needs those transitions.
+        Allowed source states: 'draft', 'pending', 'authorized' - matches
+        Odoo's actual payment_transaction.py exactly (verified directly
+        against Odoo's source, not assumed). 'done' is deliberately NOT
+        here, even though an earlier version of this project included it.
+
+        Why 'done' was removed - and the real consequence of that, so this
+        isn't a silent behavior change: _validate_amount (above) is called
+        from _process() for a transaction ALREADY in "authorized" or
+        "done", and calls this method if the provider's reported
+        amount/currency doesn't match what we expected - a possible sign of
+        a tampered notification. In OUR _process(), that check runs AFTER
+        _apply_updates() has already moved the transaction to its state
+        (unlike Odoo's own _process(), which validates the amount BEFORE
+        deciding the final state, so Odoo's version of this situation never
+        needs to move a transaction OUT of "done" at all). Matching Odoo's
+        allowed_states exactly here means an amount mismatch caught on an
+        already-"done" transaction now hits _update_state's "not in
+        allowed_states" guard - logged as a WARNING and left alone, not
+        silently ignored, but also no longer transitioned to "error" the
+        way it was before this fix. This is a deliberate, confirmed
+        trade-off (favoring exact Odoo fidelity over preserving that extra
+        safety net) rather than an oversight - restructuring _process() to
+        validate before applying, matching Odoo's real order, would close
+        this gap properly, but that's a bigger change than this fix and is
+        left for a later phase.
         """
         self._update_state(
-            allowed_states=("draft", "pending", "authorized", "done"),
+            allowed_states=("draft", "pending", "authorized"),
             target_state="error",
             state_message=state_message,
         )
