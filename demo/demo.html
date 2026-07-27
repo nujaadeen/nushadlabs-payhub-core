@@ -16,6 +16,15 @@
   #idsPanel { font-size: 0.85rem; color: #333; background: #fafafa; padding: 0.5rem 0.75rem; border-radius: 4px; white-space: pre-wrap; }
   .hidden { display: none; }
   .note { font-size: 0.9rem; color: #555; }
+  /* fieldset resets its own default border/padding/margin - it's used
+     below purely as a BEHAVIORAL grouping (so `fieldset.disabled = true`
+     disables every input inside it in one line), not for its default
+     visual box, which would otherwise show an unwanted second border
+     nested inside each <section>'s own border. */
+  fieldset { border: none; padding: 0; margin: 0; }
+  table { width: 100%; border-collapse: collapse; margin-top: 0.6rem; }
+  th, td { border: 1px solid #ccc; padding: 0.4rem; text-align: left; font-size: 0.9rem; }
+  th { background: #f0f0f0; }
 </style>
 </head>
 <body>
@@ -38,6 +47,13 @@
 
 <section id="step1">
   <h2>Step 1 &mdash; Create Tenant</h2>
+
+  <label for="tenantSelect">Or select an existing tenant</label>
+  <select id="tenantSelect">
+    <option value="">-- select a tenant --</option>
+  </select>
+
+  <p class="note">&mdash; or create a new one: &mdash;</p>
   <form id="tenantForm">
     <label for="tenantName">Name</label>
     <input type="text" id="tenantName" value="Acme Inc" required>
@@ -48,69 +64,98 @@
 
 <section id="step2">
   <h2>Step 2 &mdash; Create Customer</h2>
-  <p class="note">Uses the tenant id saved from Step 1.</p>
-  <form id="customerForm">
-    <label for="customerReference">Reference (the customer's external id, e.g. from your own system)</label>
-    <input type="text" id="customerReference" value="demo-customer-1" required>
-    <button type="submit">Create Customer</button>
-  </form>
+  <p id="step2TenantLine" class="note"></p>
+  <p id="step2DisabledNote" class="note hidden">Select or create a tenant in Step 1 first.</p>
+
+  <fieldset id="step2Fieldset">
+    <label for="customerSelect">Or select an existing customer for this tenant</label>
+    <select id="customerSelect">
+      <option value="">-- select a customer --</option>
+    </select>
+
+    <p class="note">&mdash; or create a new one: &mdash;</p>
+    <form id="customerForm">
+      <label for="customerReference">Reference (the customer's external id, e.g. from your own system)</label>
+      <input type="text" id="customerReference" value="demo-customer-1" required>
+      <button type="submit">Create Customer</button>
+    </form>
+  </fieldset>
   <pre id="customerResult"></pre>
 </section>
 
 <section id="step3">
   <h2>Step 3 &mdash; Onboard a Provider</h2>
-  <p class="note">Uses the tenant id from Step 1. No "supported currencies" field here on
-  purpose - which currencies a provider supports is a hardcoded constant in that adapter's own
-  code (payments_stripe/const.py, payments_adyen/const.py), not something set per provider via
-  the API.</p>
-  <form id="providerForm">
-    <label for="providerCode">Code</label>
-    <select id="providerCode">
-      <option value="stripe">stripe</option>
-      <option value="adyen">adyen</option>
+  <p id="step3TenantLine" class="note"></p>
+  <p id="step3DisabledNote" class="note hidden">Select or create a tenant in Step 1 first.</p>
+  <p class="note">No "supported currencies" field here on purpose - which currencies a provider
+  supports is a hardcoded constant in that adapter's own code (payments_stripe/const.py,
+  payments_adyen/const.py), not something set per provider via the API.</p>
+
+  <fieldset id="step3Fieldset">
+    <label for="providerSelectStep3">Or select an existing provider for this tenant</label>
+    <p class="note">
+      Only shows providers already in <code>"enabled"</code>/<code>"test"</code> state -
+      <code>GET /providers/</code> has always filtered out <code>"disabled"</code> ones (mirrors
+      Odoo's own "don't show a disabled provider" design - see the comment on
+      <code>ProviderListCreateView.get()</code> in <code>payments_core/views.py</code>). A
+      provider you just onboarded (still <code>"disabled"</code>) can still be activated right
+      away below without reloading the page - it just won't reappear in THIS dropdown on a later
+      visit until it's been activated.
+    </p>
+    <select id="providerSelectStep3">
+      <option value="">-- select a provider --</option>
     </select>
 
-    <label for="providerName">Name</label>
-    <input type="text" id="providerName" value="My Stripe Account" required>
+    <p class="note">&mdash; or onboard a new one: &mdash;</p>
+    <form id="providerForm">
+      <label for="providerCode">Code</label>
+      <select id="providerCode">
+        <option value="stripe">stripe</option>
+        <option value="adyen">adyen</option>
+      </select>
 
-    <div id="stripeFields">
-      <label for="stripePublishableKey">stripe_config.publishable_key</label>
-      <input type="text" id="stripePublishableKey" value="pk_test_123">
-      <label for="stripeSecretKey">stripe_config.secret_key</label>
-      <input type="text" id="stripeSecretKey" value="sk_test_123">
-      <label for="stripeWebhookSecret">stripe_config.webhook_secret</label>
-      <input type="text" id="stripeWebhookSecret" value="whsec_123">
-    </div>
+      <label for="providerName">Name</label>
+      <input type="text" id="providerName" value="My Stripe Account" required>
 
-    <div id="adyenFields" class="hidden">
-      <label for="adyenMerchantAccount">adyen_config.merchant_account</label>
-      <input type="text" id="adyenMerchantAccount" value="MA123">
-      <label for="adyenApiKey">adyen_config.api_key</label>
-      <input type="text" id="adyenApiKey" value="ak_123">
-      <label for="adyenClientKey">adyen_config.client_key</label>
-      <input type="text" id="adyenClientKey" value="ck_123">
-      <label for="adyenHmacKey">adyen_config.hmac_key</label>
-      <input type="text" id="adyenHmacKey" value="hk_123">
-      <label for="adyenThemeId">adyen_config.theme_id (optional - only needed to actually create a payment; see README)</label>
-      <input type="text" id="adyenThemeId" value="">
-    </div>
+      <div id="stripeFields">
+        <label for="stripePublishableKey">stripe_config.publishable_key</label>
+        <input type="text" id="stripePublishableKey" value="pk_test_123">
+        <label for="stripeSecretKey">stripe_config.secret_key</label>
+        <input type="text" id="stripeSecretKey" value="sk_test_123">
+        <label for="stripeWebhookSecret">stripe_config.webhook_secret</label>
+        <input type="text" id="stripeWebhookSecret" value="whsec_123">
+      </div>
 
-    <button type="submit">Create Provider</button>
-  </form>
+      <div id="adyenFields" class="hidden">
+        <label for="adyenMerchantAccount">adyen_config.merchant_account</label>
+        <input type="text" id="adyenMerchantAccount" value="MA123">
+        <label for="adyenApiKey">adyen_config.api_key</label>
+        <input type="text" id="adyenApiKey" value="ak_123">
+        <label for="adyenClientKey">adyen_config.client_key</label>
+        <input type="text" id="adyenClientKey" value="ck_123">
+        <label for="adyenHmacKey">adyen_config.hmac_key</label>
+        <input type="text" id="adyenHmacKey" value="hk_123">
+        <label for="adyenThemeId">adyen_config.theme_id (optional - only needed to actually create a payment; see README)</label>
+        <input type="text" id="adyenThemeId" value="">
+      </div>
+
+      <button type="submit">Create Provider</button>
+    </form>
+
+    <p class="note">Providers start out <code>"disabled"</code> (see <code>PaymentProvider.state</code>)
+    and can't process payments until switched to <code>"test"</code> or <code>"enabled"</code>.
+    This is a separate, explicit action rather than something Step 3's create does silently:</p>
+    <button id="activateProviderBtn" disabled>Activate Provider (set to test mode)</button>
+  </fieldset>
   <pre id="providerResult"></pre>
-
-  <p class="note">Providers start out <code>"disabled"</code> (see <code>PaymentProvider.state</code>)
-  and can't process payments until switched to <code>"test"</code> or <code>"enabled"</code>.
-  This is a separate, explicit action rather than something Step 3's create does silently:</p>
-  <button id="activateProviderBtn" disabled>Activate Provider (set to test mode)</button>
   <pre id="activateResult"></pre>
 </section>
 
 <section id="step4">
   <h2>Step 4 &mdash; List Providers for Currency</h2>
-  <p class="note">Uses the tenant id from Step 1. Only returns providers with
-  state "enabled" or "test" that support the given currency (or place no
-  restriction on currency at all).</p>
+  <p id="step4TenantLine" class="note"></p>
+  <p class="note">Only returns providers with state "enabled" or "test" that support the given
+  currency (or place no restriction on currency at all).</p>
   <form id="listProvidersForm">
     <label for="listCurrency">Currency</label>
     <input type="text" id="listCurrency" value="USD" required>
@@ -122,8 +167,18 @@
 
 <section id="step5">
   <h2>Step 5 &mdash; Create Payment Transaction</h2>
-  <p class="note">Uses the tenant id, customer id, and whichever provider is selected (radio
-  button) in Step 4.</p>
+  <p id="step5TenantLine" class="note"></p>
+
+  <label for="paymentCustomerSelect">Customer</label>
+  <select id="paymentCustomerSelect">
+    <option value="">-- select a customer --</option>
+  </select>
+
+  <label for="paymentProviderSelect">Provider (filtered by the currency below)</label>
+  <select id="paymentProviderSelect">
+    <option value="">-- select a provider --</option>
+  </select>
+
   <form id="paymentForm">
     <label for="paymentAmount">Amount</label>
     <input type="text" id="paymentAmount" value="25.00" required>
@@ -173,6 +228,59 @@
   <pre id="statusResult"></pre>
 </section>
 
+<section id="step7">
+  <h2>Step 7 &mdash; Transaction History</h2>
+  <p class="note">
+    Calls <code>GET /payments/</code> - a plain polling/refresh pattern, NOT websockets or
+    Server-Sent Events: every trigger below (page load, the Refresh button, a successful payment
+    creation in Step 5, a status check in Step 6) just re-fetches the current list from the server
+    and redraws the table from scratch. That's the right amount of complexity for a manual testing
+    tool where a human decides when to look - a real production UI pushing live updates to an
+    actual end user might reach for websockets/SSE instead, but that's real infrastructure this
+    project has no need for here.
+  </p>
+
+  <label for="historyTenantFilter">Filter by tenant (optional)</label>
+  <select id="historyTenantFilter">
+    <option value="">-- all tenants --</option>
+  </select>
+
+  <label for="historyCustomerFilter">Filter by customer (optional - requires a tenant filter above)</label>
+  <select id="historyCustomerFilter" disabled>
+    <option value="">-- all customers --</option>
+  </select>
+
+  <label for="historyProviderFilter">Filter by provider (optional - requires a tenant filter above)</label>
+  <select id="historyProviderFilter" disabled>
+    <option value="">-- all providers --</option>
+  </select>
+  <p class="note">
+    Customer/provider filters need a tenant filter first because <code>GET /customers/</code> and
+    <code>GET /providers/</code> both REQUIRE a <code>tenant_id</code> query param - there's no
+    backend endpoint that answers "list every customer/provider across every tenant" (see
+    demo/README.md and the main README's API reference).
+  </p>
+
+  <button id="refreshHistoryBtn">Refresh</button>
+
+  <table id="historyTable">
+    <thead>
+      <tr>
+        <th>Reference</th>
+        <th>Tenant</th>
+        <th>Customer</th>
+        <th>Provider</th>
+        <th>Amount</th>
+        <th>Currency</th>
+        <th>State</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody id="historyTableBody"></tbody>
+  </table>
+  <pre id="historyResult"></pre>
+</section>
+
 <script>
   // Single place to change the API's base URL, per the project's own
   // convention (see other examples in the README).
@@ -215,12 +323,6 @@
 
   let demoState = loadDemoState();
   renderIdsPanel(demoState);
-
-  document.getElementById("resetStateBtn").addEventListener("click", () => {
-    localStorage.removeItem(STORAGE_KEY);
-    demoState = {};
-    renderIdsPanel(demoState);
-  });
 
   // --- Generic fetch() helper + response display ---
   async function callApi(method, path, body) {
@@ -268,22 +370,199 @@
     document.getElementById(preId).textContent = text;
   }
 
-  // --- Step 1: Create Tenant ---
+  // --- Shared lookup caches for enriching displays that don't already
+  // include a human-readable name/reference inline ---
+  //
+  // GET /payments/ (Step 7's history table) returns raw tenant_id/
+  // customer_id, but NOT a tenant name or customer reference alongside
+  // them (it DOES already nest a provider {id, code, name} object per
+  // transaction, which is why there's no "providersById" cache below -
+  // the response already has everything needed for that column). Rather
+  // than add new backend fields or extra per-row API calls, we reuse
+  // whatever GET /tenants/ and GET /customers/?tenant_id=... calls this
+  // page ALREADY makes for its own dropdowns, and fall back to showing
+  // the bare id when a lookup misses (e.g. a transaction belonging to a
+  // tenant whose customers haven't been fetched in this session yet).
+  let tenantsById = {};   // rebuilt every time from GET /tenants/ - that call always returns the FULL list, so this is always complete.
+  let customersById = {}; // accumulated across every GET /customers/?tenant_id=... call made so far - each call only ever returns ONE tenant's customers, so entries are added, never removed.
+
+  function tenantLabel(tenantId) {
+    const t = tenantsById[tenantId];
+    return t ? t.name + " (" + tenantId + ")" : tenantId;
+  }
+
+  function customerLabel(customerId) {
+    const c = customersById[customerId];
+    return c ? c.reference + " (" + customerId + ")" : customerId;
+  }
+
+  // --- Step 1: Tenant selection (dropdown + create) ---
+  const tenantSelect = document.getElementById("tenantSelect");
+  const historyTenantFilter = document.getElementById("historyTenantFilter");
+
+  async function refreshTenantsCache() {
+    const result = await callApi("GET", "/tenants/");
+    if (!result.ok || !Array.isArray(result.data)) return [];
+    tenantsById = {};
+    result.data.forEach((t) => { tenantsById[t.id] = t; });
+    return result.data;
+  }
+
+  function populateTenantSelect(selectEl, tenants) {
+    const previousValue = selectEl.value;
+    selectEl.innerHTML = '<option value="">-- select a tenant --</option>';
+    tenants.forEach((t) => {
+      const option = document.createElement("option");
+      option.value = t.id;
+      option.textContent = t.name + " (" + t.id + ")";
+      selectEl.appendChild(option);
+    });
+    // Restore whatever was selected before repopulating (e.g. calling
+    // this again after creating ANOTHER tenant shouldn't silently reset
+    // an unrelated dropdown's current selection).
+    if ([...selectEl.options].some((o) => o.value === previousValue)) {
+      selectEl.value = previousValue;
+    }
+  }
+
+  // One GET /tenants/ call feeds BOTH the Step 1 dropdown and Step 7's
+  // tenant filter dropdown - called on page load and after creating a new
+  // tenant, so both stay in sync with the same underlying list.
+  async function reloadAllTenantDropdowns() {
+    const tenants = await refreshTenantsCache();
+    populateTenantSelect(tenantSelect, tenants);
+    populateTenantSelect(historyTenantFilter, tenants);
+  }
+
+  function renderSelectedTenantLines() {
+    const text = demoState.tenantId
+      ? "Selected tenant: " + tenantLabel(demoState.tenantId)
+      : "No tenant selected yet - select or create one in Step 1.";
+    ["step2TenantLine", "step3TenantLine", "step4TenantLine", "step5TenantLine"].forEach((id) => {
+      document.getElementById(id).textContent = text;
+    });
+
+    // fieldset.disabled disables every input/select/button inside it in
+    // one line (see the CSS comment on `fieldset` up top for why it's
+    // otherwise invisible) - Steps 2 and 3 both NEED a tenant selected to
+    // make sense at all, so their whole fieldset (both the "select
+    // existing" dropdown AND the "create new" form) is disabled together
+    // when none is selected, with the matching note shown alongside it.
+    const disabled = !demoState.tenantId;
+    document.getElementById("step2Fieldset").disabled = disabled;
+    document.getElementById("step2DisabledNote").classList.toggle("hidden", !disabled);
+    document.getElementById("step3Fieldset").disabled = disabled;
+    document.getElementById("step3DisabledNote").classList.toggle("hidden", !disabled);
+  }
+
+  let lastAppliedTenantId = demoState.tenantId;
+
+  // Called whenever the ACTIVE tenant changes - via the dropdown, or via
+  // creating a new tenant in Step 1 - both paths converge here, so both
+  // end up in exactly the same state afterward.
+  async function setActiveTenant(tenantId) {
+    const changed = tenantId !== lastAppliedTenantId;
+    lastAppliedTenantId = tenantId;
+    demoState = saveDemoState({ tenantId: tenantId || undefined });
+
+    if (changed) {
+      // The cascade: a customer/provider chosen under the PREVIOUS tenant
+      // doesn't belong to this new one - keeping either one around would
+      // silently let Step 5 create a payment mixing one tenant's customer
+      // with a DIFFERENT tenant's provider. Clearing both here, then
+      // refetching every tenant-scoped dropdown below for the new tenant,
+      // is what keeps Steps 2/3/5 honest about which tenant they're
+      // actually operating on.
+      demoState = saveDemoState({ customerId: undefined, providerId: undefined });
+    }
+
+    renderSelectedTenantLines();
+    await Promise.all([
+      loadCustomersForTenant(),
+      loadProvidersForStep3(),
+      loadProvidersForStep5(),
+    ]);
+  }
+
+  tenantSelect.addEventListener("change", () => {
+    setActiveTenant(tenantSelect.value);
+  });
+
+  document.getElementById("resetStateBtn").addEventListener("click", async () => {
+    localStorage.removeItem(STORAGE_KEY);
+    demoState = {};
+    renderIdsPanel(demoState);
+    tenantSelect.value = "";
+    await setActiveTenant(undefined);
+  });
+
   document.getElementById("tenantForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const name = document.getElementById("tenantName").value;
     const result = await callApi("POST", "/tenants/", { name });
     showResult("tenantResult", result);
     if (result.ok) {
-      demoState = saveDemoState({ tenantId: result.data.id });
+      await reloadAllTenantDropdowns(); // so the new tenant appears in every tenant dropdown immediately
+      tenantSelect.value = result.data.id;
+      await setActiveTenant(result.data.id);
     }
   });
 
-  // --- Step 2: Create Customer ---
+  // --- Step 2: Create Customer (+ "select existing" dropdown) ---
+  const customerSelect = document.getElementById("customerSelect");
+  const paymentCustomerSelect = document.getElementById("paymentCustomerSelect");
+
+  function setSelectedCustomer(customerId) {
+    demoState = saveDemoState({ customerId: customerId || undefined });
+    // Step 2's and Step 5's customer dropdowns both represent the SAME
+    // underlying selection - keep them visually in sync immediately
+    // rather than waiting for the next repopulation to catch up.
+    [customerSelect, paymentCustomerSelect].forEach((select) => {
+      select.value = customerId || "";
+    });
+  }
+
+  // Populates BOTH Step 2's and Step 5's customer dropdowns from one
+  // GET /customers/?tenant_id=... call, since they list the exact same
+  // tenant-scoped customers.
+  async function loadCustomersForTenant() {
+    [customerSelect, paymentCustomerSelect].forEach((select) => {
+      select.innerHTML = '<option value="">-- select a customer --</option>';
+    });
+    if (!demoState.tenantId) return;
+
+    const result = await callApi(
+      "GET", "/customers/?tenant_id=" + encodeURIComponent(demoState.tenantId)
+    );
+    if (!result.ok || !Array.isArray(result.data)) return;
+
+    result.data.forEach((c) => { customersById[c.id] = c; }); // also feeds Step 7's history table
+
+    [customerSelect, paymentCustomerSelect].forEach((select) => {
+      result.data.forEach((c) => {
+        const option = document.createElement("option");
+        option.value = c.id;
+        option.textContent = c.reference + " (" + c.id + ")";
+        select.appendChild(option);
+      });
+      if (demoState.customerId && [...select.options].some((o) => o.value === demoState.customerId)) {
+        select.value = demoState.customerId;
+      }
+    });
+  }
+
+  customerSelect.addEventListener("change", (e) => setSelectedCustomer(e.target.value));
+  paymentCustomerSelect.addEventListener("change", (e) => setSelectedCustomer(e.target.value));
+
   document.getElementById("customerForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!demoState.tenantId) {
-      showMessage("customerResult", "Create a tenant in Step 1 first.");
+      // Defensive backstop only - step2Fieldset is disabled whenever
+      // there's no tenant selected (see renderSelectedTenantLines), so
+      // this form shouldn't be reachable in that state at all. Kept
+      // anyway, the same way this project's backend never trusts client-
+      // side validation alone for anything that actually matters.
+      showMessage("customerResult", "Select or create a tenant in Step 1 first.");
       return;
     }
     const reference = document.getElementById("customerReference").value;
@@ -293,14 +572,18 @@
     });
     showResult("customerResult", result);
     if (result.ok) {
-      demoState = saveDemoState({ customerId: result.data.id });
+      setSelectedCustomer(result.data.id);
+      await loadCustomersForTenant(); // refresh both customer dropdowns to include the new one
+      setSelectedCustomer(result.data.id); // re-apply: repopulating above resets <select>.value
     }
   });
 
-  // --- Step 3: Onboard a Provider ---
+  // --- Step 3: Onboard a Provider (+ "select existing" dropdown) ---
   const providerCodeSelect = document.getElementById("providerCode");
   const stripeFields = document.getElementById("stripeFields");
   const adyenFields = document.getElementById("adyenFields");
+  const providerSelectStep3 = document.getElementById("providerSelectStep3");
+  const activateProviderBtn = document.getElementById("activateProviderBtn");
 
   providerCodeSelect.addEventListener("change", () => {
     const isStripe = providerCodeSelect.value === "stripe";
@@ -308,10 +591,42 @@
     adyenFields.classList.toggle("hidden", isStripe);
   });
 
+  // Lists EVERY provider for the tenant, no currency filter - unlike Step
+  // 4/5's provider lists below, the point here is just "let me reuse/
+  // activate a provider I already onboarded" regardless of what it
+  // supports.
+  async function loadProvidersForStep3() {
+    providerSelectStep3.innerHTML = '<option value="">-- select a provider --</option>';
+    if (!demoState.tenantId) return;
+
+    const result = await callApi(
+      "GET", "/providers/?tenant_id=" + encodeURIComponent(demoState.tenantId)
+    );
+    if (!result.ok || !Array.isArray(result.data)) return;
+
+    result.data.forEach((p) => {
+      const option = document.createElement("option");
+      option.value = p.id;
+      option.textContent = p.name + " (" + p.code + ", state: " + p.state + ")";
+      providerSelectStep3.appendChild(option);
+    });
+    if (demoState.providerId && [...providerSelectStep3.options].some((o) => o.value === demoState.providerId)) {
+      providerSelectStep3.value = demoState.providerId;
+    }
+  }
+
+  providerSelectStep3.addEventListener("change", (e) => {
+    const providerId = e.target.value;
+    demoState = saveDemoState({ providerId: providerId || undefined });
+    activateProviderBtn.disabled = !providerId;
+  });
+
   document.getElementById("providerForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!demoState.tenantId) {
-      showMessage("providerResult", "Create a tenant in Step 1 first.");
+      // Defensive backstop only - see the matching comment on
+      // customerForm's submit handler above for why.
+      showMessage("providerResult", "Select or create a tenant in Step 1 first.");
       return;
     }
 
@@ -348,26 +663,33 @@
     showResult("providerResult", result);
     if (result.ok) {
       demoState = saveDemoState({ providerId: result.data.id });
-      document.getElementById("activateProviderBtn").disabled = false;
+      activateProviderBtn.disabled = false;
+      await loadProvidersForStep3(); // refresh the dropdown to include the new provider
+      providerSelectStep3.value = result.data.id;
+      await loadProvidersForStep5(); // in case this new provider already matches Step 5's current currency
     }
   });
 
-  document.getElementById("activateProviderBtn").addEventListener("click", async () => {
+  activateProviderBtn.addEventListener("click", async () => {
     if (!demoState.providerId) {
-      showMessage("activateResult", "Create a provider first.");
+      showMessage("activateResult", "Create or select a provider first.");
       return;
     }
     const result = await callApi("PATCH", `/providers/${demoState.providerId}/`, {
       state: "test",
     });
     showResult("activateResult", result);
+    if (result.ok) {
+      await loadProvidersForStep3(); // reflect the new state ("test") in the dropdown's label
+      providerSelectStep3.value = demoState.providerId;
+    }
   });
 
   // --- Step 4: List Providers for Currency ---
   document.getElementById("listProvidersForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!demoState.tenantId) {
-      showMessage("listProvidersResult", "Create a tenant in Step 1 first.");
+      showMessage("listProvidersResult", "Select or create a tenant in Step 1 first.");
       return;
     }
     const currency = document.getElementById("listCurrency").value.toUpperCase();
@@ -383,6 +705,7 @@
     // page load), so without this line, picking a currency here wouldn't
     // show up in Step 5 until you reloaded the whole page.
     document.getElementById("paymentCurrency").value = currency;
+    await loadProvidersForStep5(); // Step 5's own dropdown is currency-scoped too - keep it current
 
     const choicesDiv = document.getElementById("providerChoices");
     choicesDiv.innerHTML = "";
@@ -407,20 +730,65 @@
   });
 
   // --- Step 5: Create Payment Transaction ---
+  const paymentProviderSelect = document.getElementById("paymentProviderSelect");
+  const paymentCurrencyInput = document.getElementById("paymentCurrency");
+
   // Pre-fill return_url once, on page load - see the HTML comment next to
   // the #paymentReturnUrl input above for why this has no query string.
   document.getElementById("paymentReturnUrl").value =
     window.location.origin + window.location.pathname;
   if (demoState.currency) {
-    document.getElementById("paymentCurrency").value = demoState.currency;
+    paymentCurrencyInput.value = demoState.currency;
   }
+
+  // Currency-filtered, exactly like Step 4's own list (GET
+  // /providers/?tenant_id=...&currency=...) - kept as a SEPARATE dropdown
+  // from Step 3's (which lists every provider, no currency filter) since
+  // the two answer different questions: Step 3 is "which provider do I
+  // want to manage", Step 5 is "which of this tenant's providers can
+  // actually take a payment in THIS currency".
+  async function loadProvidersForStep5() {
+    paymentProviderSelect.innerHTML = '<option value="">-- select a provider --</option>';
+    const currency = paymentCurrencyInput.value.trim().toUpperCase();
+    if (!demoState.tenantId || !currency) return;
+
+    const result = await callApi(
+      "GET",
+      "/providers/?tenant_id=" + encodeURIComponent(demoState.tenantId) +
+        "&currency=" + encodeURIComponent(currency)
+    );
+    if (!result.ok || !Array.isArray(result.data)) return;
+
+    result.data.forEach((p) => {
+      const option = document.createElement("option");
+      option.value = p.id;
+      option.textContent = p.name + " (" + p.code + ")";
+      paymentProviderSelect.appendChild(option);
+    });
+    if (demoState.providerId && [...paymentProviderSelect.options].some((o) => o.value === demoState.providerId)) {
+      paymentProviderSelect.value = demoState.providerId;
+    }
+  }
+
+  paymentProviderSelect.addEventListener("change", (e) => {
+    demoState = saveDemoState({ providerId: e.target.value || undefined });
+  });
+
+  // "change" (fires on blur/Enter), not "input" (fires on every
+  // keystroke) - refetching on every single keystroke while someone is
+  // still mid-way through typing a currency code would fire a lot of
+  // useless requests; "change" waits until they've actually finished.
+  paymentCurrencyInput.addEventListener("change", () => {
+    loadProvidersForStep5();
+  });
 
   document.getElementById("paymentForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!demoState.tenantId || !demoState.customerId || !demoState.providerId) {
       showMessage(
         "paymentResult",
-        "Need a tenant (Step 1), a customer (Step 2), and a selected provider (Step 3 or 4) first."
+        "Need a tenant (Step 1), a customer (Step 2 or the dropdown above), and a provider " +
+          "(Step 3, Step 4, or the dropdown above) selected first."
       );
       return;
     }
@@ -430,7 +798,7 @@
       provider_id: demoState.providerId,
       customer_id: demoState.customerId,
       amount: document.getElementById("paymentAmount").value,
-      currency: document.getElementById("paymentCurrency").value.toUpperCase(),
+      currency: paymentCurrencyInput.value.toUpperCase(),
       return_url: document.getElementById("paymentReturnUrl").value,
     };
     const result = await callApi("POST", "/payments/", body);
@@ -455,6 +823,10 @@
         // result.data.state, nothing further to send the customer to.
         goBtn.classList.add("hidden");
       }
+
+      // Step 7 stays current the moment a payment is created, without
+      // needing a manual "Refresh" click.
+      await refreshHistory();
     }
   });
 
@@ -480,7 +852,135 @@
     showResult("statusResult", result);
     document.querySelector("#stateLine strong").textContent =
       result.ok ? "Current state: " + result.data.state : "";
+    // Picks up any state change a webhook may have driven server-side
+    // since the last time Step 7 was refreshed - see Step 7's own note
+    // for why this is a plain refetch-and-redraw, not a live push.
+    await refreshHistory();
   });
+
+  // --- Step 7: Transaction History ---
+  const historyCustomerFilter = document.getElementById("historyCustomerFilter");
+  const historyProviderFilter = document.getElementById("historyProviderFilter");
+
+  // Populates Step 7's customer/provider filter dropdowns for whichever
+  // tenant is picked in historyTenantFilter - disabled entirely (see the
+  // note in the HTML above) when no tenant filter is set, since GET
+  // /customers/ and GET /providers/ both require a tenant_id and there's
+  // no backend endpoint for "every customer/provider across every
+  // tenant".
+  async function loadHistoryFilterOptions() {
+    const tenantId = historyTenantFilter.value;
+    historyCustomerFilter.innerHTML = '<option value="">-- all customers --</option>';
+    historyProviderFilter.innerHTML = '<option value="">-- all providers --</option>';
+
+    if (!tenantId) {
+      historyCustomerFilter.disabled = true;
+      historyProviderFilter.disabled = true;
+      return;
+    }
+    historyCustomerFilter.disabled = false;
+    historyProviderFilter.disabled = false;
+
+    const [customersResult, providersResult] = await Promise.all([
+      callApi("GET", "/customers/?tenant_id=" + encodeURIComponent(tenantId)),
+      callApi("GET", "/providers/?tenant_id=" + encodeURIComponent(tenantId)),
+    ]);
+
+    if (customersResult.ok && Array.isArray(customersResult.data)) {
+      customersResult.data.forEach((c) => {
+        customersById[c.id] = c; // also feeds the table's customer column
+        const option = document.createElement("option");
+        option.value = c.id;
+        option.textContent = c.reference;
+        historyCustomerFilter.appendChild(option);
+      });
+    }
+    if (providersResult.ok && Array.isArray(providersResult.data)) {
+      providersResult.data.forEach((p) => {
+        const option = document.createElement("option");
+        option.value = p.id;
+        option.textContent = p.name + " (" + p.code + ")";
+        historyProviderFilter.appendChild(option);
+      });
+    }
+  }
+
+  function renderHistoryTable(transactions) {
+    const tbody = document.getElementById("historyTableBody");
+    tbody.innerHTML = "";
+    // Sort order is already newest-first from the server (GET /payments/
+    // orders by created_at descending) - rendered here in the order
+    // received, no client-side re-sorting needed.
+    transactions.forEach((tx) => {
+      const tr = document.createElement("tr");
+      const providerLabel = tx.provider
+        ? tx.provider.name + " (" + tx.provider.code + ")"
+        : tx.provider_id;
+      const cells = [
+        tx.reference,
+        tenantLabel(tx.tenant_id),
+        customerLabel(tx.customer_id),
+        providerLabel,
+        tx.amount,
+        tx.currency,
+        tx.state,
+        tx.updated_at,
+      ];
+      cells.forEach((text) => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function refreshHistory() {
+    const params = new URLSearchParams();
+    if (historyTenantFilter.value) params.set("tenant_id", historyTenantFilter.value);
+    if (historyCustomerFilter.value) params.set("customer_id", historyCustomerFilter.value);
+    if (historyProviderFilter.value) params.set("provider_id", historyProviderFilter.value);
+
+    const query = params.toString() ? "?" + params.toString() : "";
+    const result = await callApi("GET", "/payments/" + query);
+    showResult("historyResult", result);
+    if (result.ok && Array.isArray(result.data)) {
+      renderHistoryTable(result.data);
+    }
+  }
+
+  historyTenantFilter.addEventListener("change", async () => {
+    await loadHistoryFilterOptions();
+    await refreshHistory();
+  });
+  historyCustomerFilter.addEventListener("change", refreshHistory);
+  historyProviderFilter.addEventListener("change", refreshHistory);
+  document.getElementById("refreshHistoryBtn").addEventListener("click", refreshHistory);
+
+  // --- Page load bootstrap ---
+  // Runs once, after every function/listener above has been defined.
+  (async () => {
+    await reloadAllTenantDropdowns();
+    tenantSelect.value = demoState.tenantId || "";
+    // Step 7's tenant filter defaults to whichever tenant is currently
+    // active, as a one-time convenience - it's independent of Step 1's
+    // selection from this point on (changing one does NOT change the
+    // other), so you can browse history for a different tenant without
+    // disturbing the tenant the rest of the page is working with.
+    historyTenantFilter.value = demoState.tenantId || "";
+
+    renderSelectedTenantLines();
+    await Promise.all([
+      loadCustomersForTenant(),
+      loadProvidersForStep3(),
+      loadProvidersForStep5(),
+      loadHistoryFilterOptions(),
+    ]);
+    if (demoState.customerId) historyCustomerFilter.value = demoState.customerId;
+    if (demoState.providerId) historyProviderFilter.value = demoState.providerId;
+
+    await refreshHistory();
+  })();
 </script>
 
 </body>
